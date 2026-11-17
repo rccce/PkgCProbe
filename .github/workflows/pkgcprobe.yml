@@ -3,7 +3,8 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'PkgCProbe/**'
+      - '**PkgCProbe**'
+      - '**.plist'
       - '.github/workflows/pkgcprobe.yml'
 jobs:
   build:
@@ -21,6 +22,25 @@ jobs:
         run: |
           exec > >(tee -a build.log) 2>&1
           set -euo pipefail
+          echo "commit $(git rev-parse --short HEAD); files in the repository:"
+          git ls-files | sed 's/^/  /'
+          # The two source files are found by their content, so they may sit in any folder.
+          SRCS=$(git grep -l -F 'OSDefineMetaClassAndStructors(PkgCProbe,' -- '*.cpp' '*.txt' || true)
+          PLISTS=$(git grep -l -F '<string>local.PkgCProbe</string>' -- '*.plist' '*.txt' || true)
+          SRC=$(printf '%s\n' "$SRCS" | sed -n '1p')
+          PLIST=$(printf '%s\n' "$PLISTS" | sed -n '1p')
+          echo "PkgCProbe.cpp: ${SRC:-NOT FOUND}; PkgCProbe Info.plist: ${PLIST:-NOT FOUND}"
+          if [[ -z "$SRC" || -z "$PLIST" ]]; then
+            echo "Both files must be in this commit. If one was committed later, use the run of that later commit,"
+            echo "or start a new run: Actions > PkgCProbe build > Run workflow."
+            exit 1
+          fi
+          [[ "$SRCS" == "$SRC" ]] || { echo "several copies of the source, using the first:"; echo "$SRCS"; }
+          [[ "$PLISTS" == "$PLIST" ]] || { echo "several copies of the plist, using the first:"; echo "$PLISTS"; }
+          echo "md5: source $(md5 -q "$SRC"), plist $(md5 -q "$PLIST")"
+          if git ls-files --error-unmatch InitHeadphone.cpp >/dev/null 2>&1 && grep -qF 'local.PkgCProbe' Info.plist 2>/dev/null; then
+            echo "WARNING: the root Info.plist is PkgCProbe's; InitHeadphone's root Info.plist was replaced."
+          fi
           mkdir -p obj dist/PkgCProbe.kext/Contents/MacOS
           cat > obj/kmod_info.c <<'KMOD'
           #include <mach/mach_types.h>
@@ -36,12 +56,12 @@ jobs:
                  -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
                  -fno-builtin -fno-common -mkernel -fno-stack-protector -O2 -Wall)
           xcrun clang -x c -std=gnu11 "${FLAGS[@]}" -c obj/kmod_info.c -o obj/kmod_info.o
-          xcrun clang++ -x c++ -std=gnu++17 "${FLAGS[@]}" -fapple-kext -fno-rtti -fno-exceptions \
-            -c PkgCProbe/PkgCProbe.cpp -o obj/PkgCProbe.o
+          xcrun clang++ -x c++ -std=gnu++17 "${FLAGS[@]}" -fapple-kext -fno-rtti -fno-exceptions -ferror-limit=0 \
+            -c "$SRC" -o obj/PkgCProbe.o
           BIN=dist/PkgCProbe.kext/Contents/MacOS/PkgCProbe
           xcrun clang++ -target x86_64-apple-macos10.13 -isysroot "$SYSROOT" -nostdlib -fapple-kext \
             -Xlinker -kext obj/PkgCProbe.o obj/kmod_info.o -lcc_kext -o "$BIN"
-          cp PkgCProbe/Info.plist dist/PkgCProbe.kext/Contents/Info.plist
+          cp "$PLIST" dist/PkgCProbe.kext/Contents/Info.plist
           plutil -lint dist/PkgCProbe.kext/Contents/Info.plist
           FT=$(file "$BIN"); echo "$FT"
           [[ "$FT" == *"kext bundle"* && "$FT" == *x86_64* ]] || { echo "not an x86_64 kext"; exit 1; }
@@ -49,7 +69,9 @@ jobs:
           LC=$(otool -l "$BIN"); [[ "$LC" != *LC_DYLD_CHAINED_FIXUPS* ]] || { echo "chained fixups found"; exit 1; }
           echo "undefined symbols (all must come from the kernel or IOPCIFamily):"
           nm -u "$BIN"
-          echo "build OK"
+          echo "kmutil libraries on this runner (information only):"
+          perl -e 'alarm 120; exec @ARGV' kmutil libraries -p dist/PkgCProbe.kext --undef-symbols 2>&1 || echo "(kmutil exit status $?)"
+          echo "build OK from $SRC"
       - uses: actions/upload-artifact@v4
         with:
           name: PkgCProbe
