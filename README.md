@@ -38,15 +38,19 @@ pmtel 的结果显示，芯片组里 SATA 控制器一直上报 10.2 µs 的延�
 
 ## 编译（GitHub Actions）
 
-仓库里放这三个文件：
+仓库里要有这三个文件：
 
-- `PkgCProbe/PkgCProbe.cpp`
-- `PkgCProbe/Info.plist`
-- `.github/workflows/pkgcprobe.yml`（内容用本目录的 `pkgcprobe.yml`）
+| 仓库里的路径 | 内容 |
+|---|---|
+| `PkgCProbe/PkgCProbe.cpp` | 本目录的 `PkgCProbe.cpp` |
+| `PkgCProbe/Info.plist` | 本目录的 `Info.plist` |
+| `.github/workflows/pkgcprobe.yml` | 本目录的 `pkgcprobe.yml` |
 
-可以放进 InitHeadphone 那个仓库，但一定要放在 `PkgCProbe` 文件夹里，不要覆盖根目录的 `Info.plist`。InitHeadphone 的工作流会跟着再跑一次，没有影响。也可以新建一个仓库。
+在 GitHub 网页上建带文件夹的文件：Add file → Create new file，文件名一栏输入 `PkgCProbe/PkgCProbe.cpp`（输入 `/` 时自动变成文件夹），粘贴内容，提交。另外两个文件同样处理。
 
-推送后打开 Actions → `PkgCProbe build`，完成后下载 `PkgCProbe`，解压得到 `PkgCProbe.kext`。编译失败时下载 `PkgCProbe-build-log` 发我。
+编译脚本按文件内容查找这两个源文件，放在别的文件夹也能编。仓库根目录如果有 InitHeadphone 的 `Info.plist`，不要把这里的 `Info.plist` 传到根目录，否则会替换掉它。
+
+每提交一个文件，Actions 就会跑一次。用最后一次提交对应的那次运行；也可以在 Actions → `PkgCProbe build` → Run workflow 手动再跑一次。完成后下载 `PkgCProbe`，解压得到 `PkgCProbe.kext`。编译失败时下载 `PkgCProbe-build-log` 发我，日志开头会列出仓库里的文件。
 
 ## 安装（OpenCore）
 
@@ -95,3 +99,8 @@ pmset -g batt | head -n 2 >> ~/Desktop/pkgc.txt
 ## 停用
 
 把 `config.plist` 里这一项的 `Enabled` 改为 False，重启。
+
+## 修改记录
+
+- r2（2026-11-17）：编译脚本改为按内容查找源文件，并在日志里列出仓库文件。代码里映射 PMC 寄存器改用 `map()`，查找 SATA 控制器改为在 PMC 所在的 PCI 总线上找。测试内容、写入的寄存器和范围都不变。
+- r1（2026-11-17）：第一版。

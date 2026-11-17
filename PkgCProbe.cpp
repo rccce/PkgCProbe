@@ -27,6 +27,9 @@
  * these ignore bits set and set them again after every wake.
  *
  * Results: ioreg property "Results" and kernel log lines starting with "PkgCProbe:".
+ *
+ * r2: the PMC registers are mapped with IOMemoryDescriptor::map() (no kernel_task), and the
+ * AHCI controller is looked up among the PMC's siblings on PCI bus 0 (no matching dictionary).
  */
 
 #include <IOKit/IOService.h>
@@ -41,7 +44,7 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
-#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
@@ -59,6 +62,11 @@ constexpr UInt32 kPwrmMapLength  = 0x1000;
 constexpr UInt32 kLtrIgnore      = 0x30C;
 constexpr UInt32 kLtrPlatform    = 0x350;
 constexpr UInt32 kLtrAggregated  = 0x354;
+
+// AHCI controller (00:17.0 on Sunrise Point)
+constexpr UInt8  kPciClassConfig = 0x08;          // bits 31:8 class code, 7:0 revision
+constexpr UInt32 kAhciClass      = 0x010601;      // mass storage, SATA, AHCI
+constexpr UInt8  kAhciBarConfig  = 0x24;          // BAR5 (ABAR)
 
 struct LtrBlock {
     const char *name;
@@ -464,12 +472,12 @@ bool PkgCProbe::tryPwrm(UInt32 base)
     IODeviceMemory *memory = IODeviceMemory::withRange(base, kPwrmMapLength);
     if (memory == nullptr)
         return false;
-    IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+    IOMemoryMap *mapping = memory->map(kIOMapInhibitCache);   // kernel map, uncached
     memory->release();
-    if (map == nullptr)
+    if (mapping == nullptr)
         return false;
 
-    volatile UInt32 *regs = reinterpret_cast<volatile UInt32 *>(map->getVirtualAddress());
+    volatile UInt32 *regs = reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress());
     UInt32 ignore = regs[kLtrIgnore / 4];
     bool requirement = false;
     bool floating = false;
@@ -481,11 +489,11 @@ bool PkgCProbe::tryPwrm(UInt32 base)
             requirement = true;
     }
     if ((ignore & 0xFFFC0000) != 0 || !requirement || floating) {
-        map->release();
+        mapping->release();
         return false;
     }
 
-    pwrmMap = map;
+    pwrmMap = mapping;
     pwrm = regs;
     pwrmBase = base;
     ignoreOriginal = ignore;
@@ -536,7 +544,7 @@ void PkgCProbe::describeStart()
     PcpLine line;
     UInt32 regs[4];
     pcpCpuid(1, regs);
-    line.add("CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
+    line.add("r2; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
     if (pwrm == nullptr)
         line.add("; no PMC LTR registers found there or at 0x%08x: read-only, nothing will be changed", kPwrmDefault);
     else
@@ -586,24 +594,21 @@ void PkgCProbe::describeLtr(const char *title)
     addResult(line.c_str());
 }
 
+// The AHCI controller is on the same PCI bus as the PMC: look at the PMC's siblings
+// for class code 01.06.01 and map its BAR5. Only reads its registers.
 void PkgCProbe::findAhci()
 {
-    OSDictionary *matching = IOService::serviceMatching("IOPCIDevice");
-    if (matching == nullptr)
-        return;
-    OSString *classMatch = OSString::withCString("0x01060100&0xffffff00");   // SATA, AHCI
-    if (classMatch != nullptr) {
-        matching->setObject("IOPCIClassMatch", classMatch);
-        classMatch->release();
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children != nullptr) {
+        OSObject *child = nullptr;
+        while (ahciMap == nullptr && (child = children->getNextObject()) != nullptr) {
+            IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
+            if (device != nullptr && (device->configRead32(kPciClassConfig) >> 8) == kAhciClass)
+                ahciMap = device->mapDeviceMemoryWithRegister(kAhciBarConfig, kIOMapInhibitCache);
+        }
+        children->release();
     }
-    IOService *service = IOService::copyMatchingService(matching);
-    matching->release();
-
-    IOPCIDevice *sata = OSDynamicCast(IOPCIDevice, service);
-    if (sata != nullptr)
-        ahciMap = sata->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5, kIOMapInhibitCache);
-    if (service != nullptr)
-        service->release();
     if (ahciMap == nullptr) {
         addResult("AHCI: no AHCI controller, or its registers could not be mapped");
         return;
