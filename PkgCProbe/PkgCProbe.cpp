@@ -60,6 +60,28 @@
  *     chipset's xHCI is not in D0.
  * (4) USB: connected ports that are neither in U0, U2 nor U3 (for example not enabled because
  *     the port is not in the USB map) are counted as "other".
+ *
+ * r7b (pkgc8) ran without trouble: with no USB device at all (chipset xHCI: 0 of 24 ports
+ * connected, XHCI LTR "none") PC3 rose to 70-78 %, but PC6 stayed 0; every attempt to go deeper
+ * was still demoted with IOSF_NOT_BLOCKED. So USB alone is not the blocker.
+ * r8: PEG0 power gating together with idle USB. PEG0 (00:01.0) is parked by the firmware's
+ * Windows 10 path: L2/L3 handshake done (0x248 bit 14 = 1, LTSSM 0xC74 = 0x165), but its lanes
+ * and bundles are not power gated. r4 gated them (and D3hot) without any problem, but while the
+ * USB devices were active. r8 writes exactly what r4 wrote (never Link Disable, which froze r7):
+ * lanes (0xC38 bit 3, 0xC20 bits 5:4 = 3), bundles (bit 31 of 0x91C-0x9FC) and D3hot (PMCSR),
+ * only while PEG0 is 8086:1901 with no device behind it, its link down and the handshake done.
+ * Put back in the firmware's PGON order (D0, lanes, bundles), also before sleep.
+ * Also new: PEG0's bus numbers parked as 0x00FEFF00 (secondary 0xFF > subordinate 0xFE), as Apple's
+ * firmware leaves PEG0 when it parks it (\_SB.PCI0.PEG0.GFX0.PWRD on a MacBookPro15,1, where PC7-PC10
+ * needed PEG0 parked); here it stays 0x00010100 (secondary and subordinate 1).
+ * (1) Phases: daily; ignore all; + PEG0 gated (lanes, bundles); + bus numbers parked; + D3hot;
+ *     + idle root ports off + Wi-Fi L1; ignore SATA + PEG0 gated + buses parked; daily again.
+ * (2) Hold: after the test PEG0 stays gated (lanes, bundles, buses parked) for PegHoldSeconds (default 90),
+ *     so that pkgc2.sh's pmtel windows measure that state; then it is put back. A sleep ends
+ *     the hold at once. Not used with WifiL1.
+ * (3) Shutdown and restart (root domain priority interest) end a running test or the hold like a
+ *     sleep, so that PEG0 is put back before the firmware's _PTS powers the dGPU on. Without
+ *     these messages PEG0 is never gated.
  */
 
 #include <IOKit/IOService.h>
@@ -139,6 +161,20 @@ constexpr unsigned kMaxIdlePorts = 8;
 constexpr unsigned kMaxUsbPorts = 32;
 constexpr UInt8  kPchXhciDevFn = 0x14 << 3;      // 00:14.0
 
+// r8: the CPU's PCIe graphics port PEG0 (00:01.0) and its power gating registers (firmware PGOF/PGON)
+constexpr int    kPegDevFn       = 0x08;          // 00:01.0
+constexpr UInt32 kEcamPeg        = 1u << 15;      // bus 0, device 1, function 0 in the ECAM window
+constexpr UInt32 kPegId          = 0x19018086;    // Skylake/Kaby Lake PEG10 (x16)
+constexpr UInt32 kPegL23         = 0x248;         // bit 14: L2/L3 handshake done
+constexpr UInt32 kPegC20         = 0xC20;         // bits 5:4 (P0AP)
+constexpr UInt32 kPegC38         = 0xC38;         // bit 3 (P0RM)
+constexpr UInt32 kPegLtssm       = 0xC74;         // LTSSM state
+constexpr UInt32 kPegBuses       = 0x18;          // primary, secondary, subordinate bus numbers
+constexpr UInt32 kPegBusesParked = 0x00FEFF00;    // secondary 0xFF > subordinate 0xFE: no bus behind PEG0
+const UInt32 kPegBundleRegs[] = {0x91C, 0x93C, 0x95C, 0x97C, 0x99C, 0x9BC, 0x9DC, 0x9FC};   // BSP1-BSP8
+constexpr unsigned kPegBundleCount = sizeof(kPegBundleRegs) / sizeof(kPegBundleRegs[0]);
+constexpr UInt32 kDefaultHoldSeconds = 90;
+
 struct LtrBlock {
     const char *name;
     UInt32 offset;
@@ -174,7 +210,14 @@ enum PhaseAction : UInt32 {
     kAsFound      = 0,
     kWifiL1       = 1u << 0,    // ASPM L1 enable on the Wi-Fi card (root port already has L1)
     kIdlePortsOff = 1u << 1,    // Link Disable on PCH root ports with no device and no link
+    kPegLanes     = 1u << 2,    // r8: PEG0 lanes power gated (0xC38 bit 3, 0xC20 bits 5:4 = 3)
+    kPegBundles   = 1u << 3,    // r8: PEG0 bundles power gated (bit 31 of 0x91C-0x9FC)
+    kPegD3        = 1u << 4,    // r8: PEG0 PMCSR D3hot
+    kPegBusPark   = 1u << 5,    // r8: PEG0 bus numbers 0x00FEFF00, as Apple's firmware leaves a parked PEG0
 };
+constexpr UInt32 kPegGated = kPegLanes | kPegBundles;
+constexpr UInt32 kPegHold  = kPegLanes | kPegBundles | kPegBusPark;
+constexpr UInt32 kPegMask  = kPegLanes | kPegBundles | kPegD3 | kPegBusPark;
 
 struct Phase {
     UInt32 mask;
@@ -182,13 +225,16 @@ struct Phase {
     const char *name;
 };
 
-// r7b: each phase adds one change to the one before; Wi-Fi L1 comes last
+// r8: P1-P5 each add one change to the one before; P6 is the candidate daily setting
 const Phase kPhases[] = {
-    {kIgnoreSATA, kAsFound,                "ignore SATA (daily setting)"},
-    {kIgnoreAll,  kAsFound,                "ignore all"},
-    {kIgnoreAll,  kIdlePortsOff,           "ignore all + idle root ports off"},
-    {kIgnoreAll,  kIdlePortsOff | kWifiL1, "ignore all + idle root ports off + Wi-Fi L1"},
-    {kIgnoreSATA, kAsFound,                "ignore SATA (daily setting) again"},
+    {kIgnoreSATA, kAsFound,                                   "ignore SATA (daily setting)"},
+    {kIgnoreAll,  kAsFound,                                   "ignore all"},
+    {kIgnoreAll,  kPegGated,                                  "ignore all + PEG0 gated"},
+    {kIgnoreAll,  kPegHold,                                   "ignore all + PEG0 gated + buses parked"},
+    {kIgnoreAll,  kPegHold | kPegD3,                          "ignore all + PEG0 gated + buses parked + D3hot"},
+    {kIgnoreAll,  kPegHold | kPegD3 | kIdlePortsOff | kWifiL1, "ignore all + PEG0 all + 1c.0 off + Wi-Fi L1"},
+    {kIgnoreSATA, kPegHold,                                   "ignore SATA + PEG0 gated + buses parked"},
+    {kIgnoreSATA, kAsFound,                                   "ignore SATA (daily setting) again"},
 };
 constexpr unsigned kPhaseCount = sizeof(kPhases) / sizeof(kPhases[0]);
 
@@ -498,6 +544,7 @@ private:
     IOWorkLoop *workLoop {nullptr};
     IOTimerEventSource *timer {nullptr};
     IONotifier *powerNotifier {nullptr};
+    IONotifier *shutdownNotifier {nullptr};  // r8: shutdown and restart messages (root domain priority interest)
     OSArray *results {nullptr};
 
     UInt32 pwrmConfig {0};
@@ -513,6 +560,7 @@ private:
     UInt32 applyMask {0};
     bool runTest {true};
     bool keepWifiL1 {false};
+    UInt32 holdSeconds {kDefaultHoldSeconds};   // r8
 
     State state {kIdle};
     bool awake {true};
@@ -573,6 +621,23 @@ private:
     UInt32 usbU3[kMaxUsbPorts] {};
     UInt32 usbOther[kMaxUsbPorts] {};        // r7b: connected, but neither U0, U2 nor U3
 
+    // r8: PEG0 power gating (the device and its ECAM window, retained while prepared)
+    IOPCIDevice *pegDevice {nullptr};
+    IOMemoryMap *pegMap {nullptr};
+    volatile UInt32 *pegCfg {nullptr};
+    UInt32 pegPm {0};                        // PCI power management capability offset
+    UInt32 pegExpress {0};                   // PCI Express capability offset
+    bool pegChecked {false};
+    bool pegReady {false};
+    UInt32 pegApplied {0};                   // kPeg* bits that are in effect now
+    UInt32 pegPmcsr {0};                     // values as found before the test
+    UInt32 pegC20 {0};
+    UInt32 pegC38 {0};
+    UInt32 pegBusNumbers {0};
+    UInt32 pegBundle[kPegBundleCount] {};
+    char pegWhy[120] {};
+    bool holding {false};                    // r8: PEG0 kept gated after the test
+
     PcpLine phaseNote;
 
     UInt32 readPwrm(UInt32 offset) const { return pwrm[offset / 4]; }
@@ -602,6 +667,15 @@ private:
     void xhciPrepare();
     void xhciReadCaps();
     void xhciRelease();
+    IOPCIDevice *busZeroDevice(int devfn);
+    bool pegHasDevice(IOPCIDevice *peg);
+    void pegPrepare();
+    const char *pegParked();
+    const char *pegSet(UInt32 want);
+    void pegDescribe(PcpLine &line);
+    void pegRelease();
+    void startHold();
+    void endHold(const char *why);
     void applyActions(UInt32 actions);
     void restoreActions();
     void writeIgnore(UInt32 value);
@@ -621,6 +695,9 @@ private:
     static IOReturn setAwakeAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
     static IOReturn powerMessage(void *target, void *refCon, UInt32 messageType,
                                  IOService *provider, void *messageArgument, vm_size_t argSize);
+    static IOReturn shutdownAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
+    static IOReturn shutdownMessage(void *target, void *refCon, UInt32 messageType,
+                                    IOService *provider, void *messageArgument, vm_size_t argSize);
 };
 
 OSDefineMetaClassAndStructors(PkgCProbe, IOService);
@@ -669,6 +746,10 @@ bool PkgCProbe::start(IOService *provider)
         releaseResources();
         return false;
     }
+    // r8: shutdown and restart reach only priority clients (registerPrioritySleepWakeInterest is a
+    // plain function in RootDomain.h, as in Apple's "Installing Shutdown Hooks" sample); without
+    // these messages PEG0 is never gated
+    shutdownNotifier = registerPrioritySleepWakeInterest(&PkgCProbe::shutdownMessage, this, nullptr);
 
     describeStart();
     describeLtr("LTR at start:");
@@ -711,6 +792,10 @@ void PkgCProbe::releaseResources()
         powerNotifier->remove();
         powerNotifier = nullptr;
     }
+    if (shutdownNotifier != nullptr) {
+        shutdownNotifier->remove();
+        shutdownNotifier = nullptr;
+    }
     if (timer != nullptr) {
         timer->cancelTimeout();
         if (workLoop != nullptr)
@@ -731,6 +816,8 @@ void PkgCProbe::releaseResources()
         }
     }
     state = kDone;
+    holding = false;                         // r8: pegRelease puts PEG0 back if it is still gated
+    pegRelease();
     xhciRelease();
     idleRelease();
     wifiForget();
@@ -833,6 +920,11 @@ void PkgCProbe::readOptions()
     flag = OSDynamicCast(OSBoolean, getProperty("WifiL1"));
     if (flag != nullptr)
         keepWifiL1 = flag->isTrue();
+    number = OSDynamicCast(OSNumber, getProperty("PegHoldSeconds"));     // r8
+    if (number != nullptr) {
+        UInt32 value = number->unsigned32BitValue();
+        holdSeconds = value > 600 ? 600 : value;
+    }
 }
 
 void PkgCProbe::describeStart()
@@ -840,7 +932,7 @@ void PkgCProbe::describeStart()
     PcpLine line;
     UInt32 regs[4];
     pcpCpuid(1, regs);
-    line.add("r7b; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
+    line.add("r8; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
     if (pwrm == nullptr)
         line.add("; no PMC LTR registers found there or at 0x%08x: read-only, nothing will be changed", kPwrmDefault);
     else
@@ -860,8 +952,8 @@ void PkgCProbe::describeStart()
     } else {
         line.add("; not a Skylake/Kaby Lake CPU: MSRs not read");
     }
-    line.add("; StartDelay %u s, PhaseSeconds %u s, RunTest %s, ApplyMask 0x%x, WifiL1 %s",
-             startDelay, phaseSeconds, runTest ? "yes" : "no", applyMask, keepWifiL1 ? "yes" : "no");
+    line.add("; StartDelay %u s, PhaseSeconds %u s, RunTest %s, ApplyMask 0x%x, WifiL1 %s, PegHoldSeconds %u",
+             startDelay, phaseSeconds, runTest ? "yes" : "no", applyMask, keepWifiL1 ? "yes" : "no", holdSeconds);
     addResult(line.c_str());
 }
 
@@ -1625,6 +1717,306 @@ void PkgCProbe::xhciRelease()
     xhciPorts = 0;
 }
 
+// r8: a PCI device on bus 0 (the PMC's bus) by device and function, retained; nullptr if none.
+IOPCIDevice *PkgCProbe::busZeroDevice(int devfn)
+{
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children == nullptr)
+        return nullptr;
+    IOPCIDevice *found = nullptr;
+    OSObject *child = nullptr;
+    while (found == nullptr && (child = children->getNextObject()) != nullptr) {
+        IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
+        if (device != nullptr && pciDevFn(device) == devfn) {
+            device->retain();
+            found = device;
+        }
+    }
+    children->release();
+    return found;
+}
+
+// r8 (as r4): true if any PCI device is registered behind PEG0 (two levels down: bridge driver,
+// then devices); also true if that cannot be told.
+bool PkgCProbe::pegHasDevice(IOPCIDevice *peg)
+{
+    bool found = false;
+    OSIterator *level1 = peg->getChildIterator(gIOServicePlane);
+    if (level1 == nullptr)
+        return true;
+    OSObject *a = nullptr;
+    while (!found && (a = level1->getNextObject()) != nullptr) {
+        if (OSDynamicCast(IOPCIDevice, a) != nullptr) {
+            found = true;
+            break;
+        }
+        IORegistryEntry *entry = OSDynamicCast(IORegistryEntry, a);
+        OSIterator *level2 = entry != nullptr ? entry->getChildIterator(gIOServicePlane) : nullptr;
+        if (level2 == nullptr)
+            continue;
+        OSObject *b = nullptr;
+        while ((b = level2->getNextObject()) != nullptr) {
+            if (OSDynamicCast(IOPCIDevice, b) != nullptr) {
+                found = true;
+                break;
+            }
+        }
+        level2->release();
+    }
+    level1->release();
+    return found;
+}
+
+// r8: once per test: maps PEG0's ECAM window, decides whether it may be gated and keeps the values
+// to put back. Only reads.
+void PkgCProbe::pegPrepare()
+{
+    if (pegChecked)
+        return;
+    pegChecked = true;
+    pegReady = false;
+    pegApplied = 0;
+    pegWhy[0] = '\0';
+    IOPCIDevice *host = busZeroDevice(0);
+    IOPCIDevice *peg = busZeroDevice(kPegDevFn);
+    UInt32 id = peg != nullptr ? peg->configRead32(0x00) : 0;
+    const char *why = nullptr;
+    if (!writable)
+        why = "read-only mode";
+    else if (!msrUsable)
+        why = "not a Skylake/Kaby Lake CPU";
+    else if (shutdownNotifier == nullptr)
+        why = "no shutdown and restart messages";
+    else if (peg == nullptr)
+        why = "no PCI device 00:01.0";
+    else if (id != kPegId)
+        why = "00:01.0 is not 8086:1901";
+
+    IOMemoryMap *mapping = nullptr;
+    volatile UInt32 *cfg = nullptr;
+    if (why == nullptr) {
+        UInt64 ecam = ecamBase(host);
+        IODeviceMemory *memory = ecam != 0 ? IODeviceMemory::withRange(ecam + kEcamPeg, kMapLength) : nullptr;
+        if (memory != nullptr) {
+            mapping = memory->map(kIOMapInhibitCache);
+            memory->release();
+        }
+        cfg = mapping != nullptr ? reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress()) : nullptr;
+        if (cfg == nullptr)
+            why = "ECAM not mapped";
+        else if (cfg[0] != id)
+            why = "ECAM does not show 00:01.0";
+    }
+    UInt32 pm = 0;
+    UInt32 express = 0;
+    if (why == nullptr) {
+        pm = findCapability(peg, 0x01);
+        express = findCapability(peg, 0x10);
+        if (pm == 0 || express == 0)
+            why = "PEG0 capabilities not found";
+        else if ((cfg[(pm + 4) / 4] & 3) != 0)
+            why = "PEG0 is not in D0";
+    }
+    if (host != nullptr)
+        host->release();
+
+    PcpLine line;
+    line.add("PEG0 00:01.0:");
+    if (why == nullptr) {
+        pegDevice = peg;                     // keeps the retain from busZeroDevice
+        pegMap = mapping;
+        pegCfg = cfg;
+        pegPm = pm;
+        pegExpress = express;
+        line.add(" ");
+        pegDescribe(line);
+        why = pegParked();
+        if (why != nullptr) {
+            pegRelease();                    // nothing was written: only unmaps and releases
+            peg = nullptr;
+            mapping = nullptr;
+        }
+    }
+    if (why != nullptr) {
+        snprintf(pegWhy, sizeof(pegWhy), "%s", why);
+        line.add("; gating not used: %s", why);
+        if (mapping != nullptr)
+            mapping->release();
+        if (peg != nullptr)
+            peg->release();
+        addResult(line.c_str());
+        return;
+    }
+    pegPmcsr = cfg[(pm + 4) / 4];
+    pegC20 = cfg[kPegC20 / 4];
+    pegC38 = cfg[kPegC38 / 4];
+    pegBusNumbers = cfg[kPegBuses / 4];
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        pegBundle[i] = cfg[kPegBundleRegs[i] / 4];
+    pegReady = true;
+    line.add("; gating ready (lanes, bundles, D3hot as in r4, bus numbers; never Link Disable)");
+    addResult(line.c_str());
+}
+
+// r8: nullptr if PEG0 is parked as the firmware leaves it with the dGPU off (no device behind it,
+// link down and not disabled, L2/L3 handshake done), otherwise why it must not be gated.
+const char *PkgCProbe::pegParked()
+{
+    if (pegCfg == nullptr || pegDevice == nullptr || pegDevice->isInactive())
+        return "PEG0 not prepared";
+    if (pegCfg[0] != kPegId)
+        return "PEG0 not readable";
+    UInt32 link = pegCfg[(pegExpress + kExpLinkCtl) / 4];
+    if (link == 0xFFFFFFFF)
+        return "PEG0 not readable";
+    if ((link & kLinkDllActive) != 0)
+        return "PEG0 link is up";
+    if ((link & kLinkDisable) != 0)
+        return "PEG0 link is disabled";
+    if (((pegCfg[kPegL23 / 4] >> 14) & 1) == 0)
+        return "PEG0 L2/L3 handshake not done (0x248 bit 14 is 0)";
+    if (pegHasDevice(pegDevice))
+        return "a device is attached behind PEG0";
+    return nullptr;
+}
+
+// r8: brings PEG0 to the wanted state (kPegLanes, kPegBundles, kPegD3, kPegBusPark). Takes away in the
+// order of the firmware's PGON (D0, lanes, bundles), then the bus numbers; adds the bus numbers first
+// (as Apple's PWRD), then in the order of PGOF (lanes, bundles), then D3hot, with the values r4 wrote.
+// Adds only while PEG0 is parked. Returns nullptr, or why it added nothing.
+const char *PkgCProbe::pegSet(UInt32 want)
+{
+    if (!pegReady || pegCfg == nullptr)
+        return pegWhy[0] != '\0' ? pegWhy : "not prepared";
+    want &= kPegMask;
+    UInt32 remove = pegApplied & ~want;
+    if ((remove & kPegD3) != 0) {
+        pegCfg[(pegPm + 4) / 4] = pegPmcsr & ~0x8000u;          // D0 as found; PME status never written as 1
+        IOSleep(10);
+        pegApplied &= ~kPegD3;
+    }
+    if ((remove & kPegLanes) != 0) {
+        pegCfg[kPegC20 / 4] = pegC20;
+        pegCfg[kPegC38 / 4] = pegC38;
+        pegApplied &= ~kPegLanes;
+    }
+    if ((remove & kPegBundles) != 0) {
+        for (unsigned i = 0; i < kPegBundleCount; i++)
+            pegCfg[kPegBundleRegs[i] / 4] = pegBundle[i];
+        pegApplied &= ~kPegBundles;
+    }
+    if ((remove & kPegBusPark) != 0) {
+        pegCfg[kPegBuses / 4] = pegBusNumbers;
+        pegApplied &= ~kPegBusPark;
+    }
+    UInt32 add = want & ~pegApplied;
+    if (add == 0)
+        return nullptr;
+    const char *why = pegParked();
+    if (why != nullptr)
+        return why;
+    if ((add & kPegBusPark) != 0) {
+        pegCfg[kPegBuses / 4] = (pegBusNumbers & 0xFF0000FFu) | kPegBusesParked;   // latency timer, primary as found
+        pegApplied |= kPegBusPark;
+    }
+    if ((add & kPegLanes) != 0) {
+        pegCfg[kPegC38 / 4] = pegC38 | 0x8u;
+        pegCfg[kPegC20 / 4] = (pegC20 & ~0x30u) | 0x30u;
+        pegApplied |= kPegLanes;
+    }
+    if ((add & kPegBundles) != 0) {
+        for (unsigned i = 0; i < kPegBundleCount; i++)
+            pegCfg[kPegBundleRegs[i] / 4] = pegBundle[i] | 0x80000000u;
+        pegApplied |= kPegBundles;
+    }
+    if ((add & kPegD3) != 0) {
+        pegCfg[(pegPm + 4) / 4] = (pegPmcsr & ~0x8003u) | 3u;   // D3hot; PME status never written as 1
+        IOSleep(10);
+        pegApplied |= kPegD3;
+    }
+    return nullptr;
+}
+
+// r8: PEG0's power state, link status and gating registers. Only reads.
+void PkgCProbe::pegDescribe(PcpLine &line)
+{
+    if (pegCfg == nullptr) {
+        line.add("PEG0 not mapped");
+        return;
+    }
+    unsigned gated = 0;
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        gated += (pegCfg[kPegBundleRegs[i] / 4] >> 31) & 1;
+    UInt32 pmcsr = pegPm != 0 ? pegCfg[(pegPm + 4) / 4] : 0;
+    UInt32 link = pegExpress != 0 ? pegCfg[(pegExpress + kExpLinkCtl) / 4] : 0;
+    line.add("PEG0 D%u, buses 0x%08x, LNKSTS 0x%04x, 0x248 0x%08x, LTSSM 0x%03x, 0xC20 0x%08x, 0xC38 0x%08x, bundles gated %u/%u",
+             pmcsr & 3, pegCfg[kPegBuses / 4], link >> 16, pegCfg[kPegL23 / 4], pegCfg[kPegLtssm / 4] & 0xFFF,
+             pegCfg[kPegC20 / 4], pegCfg[kPegC38 / 4], gated, kPegBundleCount);
+}
+
+// r8: puts PEG0 back if anything is still applied, then unmaps and releases it.
+void PkgCProbe::pegRelease()
+{
+    if (pegApplied != 0)
+        pegSet(0);
+    pegReady = false;
+    pegApplied = 0;
+    pegCfg = nullptr;
+    pegPm = 0;
+    pegExpress = 0;
+    if (pegMap != nullptr) {
+        pegMap->release();
+        pegMap = nullptr;
+    }
+    if (pegDevice != nullptr) {
+        pegDevice->release();
+        pegDevice = nullptr;
+    }
+}
+
+// r8: after the test, keeps PEG0 gated (lanes, bundles, bus numbers) for holdSeconds, so that
+// pkgc2.sh's pmtel windows measure that state. Ends at the timer, before sleep, shutdown or restart,
+// or when the driver stops.
+void PkgCProbe::startHold()
+{
+    const char *why = pegSet(kPegHold);
+    if (why != nullptr || pegApplied != kPegHold) {
+        PcpLine line;
+        line.add("hold not used: %s", why != nullptr ? why : "PEG0 not gated");
+        addResult(line.c_str());
+        pegRelease();
+        return;
+    }
+    holding = true;
+    UInt64 now = uptimeNS() / 1000000000ULL;
+    PcpLine line;
+    line.add("hold: SATA LTR ignored and PEG0 gated (lanes, bundles, buses parked) from %llu s after boot for %u s; ",
+             now, holdSeconds);
+    pegDescribe(line);
+    addResult(line.c_str());
+    PcpLine phaseText;
+    phaseText.add("hold: ignore SATA + PEG0 gated + buses parked, until %llu s after boot", now + holdSeconds);
+    setProperty("Phase", phaseText.c_str());
+    if (timer != nullptr)
+        timer->setTimeoutMS(holdSeconds * 1000);
+}
+
+// r8: ends the hold: PEG0 back as found, then unmapped and released.
+void PkgCProbe::endHold(const char *why)
+{
+    if (!holding)
+        return;
+    holding = false;
+    pegSet(0);
+    PcpLine line;
+    line.add("hold ended (%s) at %llu s after boot; ", why, uptimeNS() / 1000000000ULL);
+    pegDescribe(line);
+    addResult(line.c_str());
+    setProperty("Phase", "done; PEG0 put back");
+    pegRelease();
+}
+
 // What a phase does besides the ignore register. The note goes into the phase's result line.
 void PkgCProbe::applyActions(UInt32 actions)
 {
@@ -1659,11 +2051,26 @@ void PkgCProbe::applyActions(UInt32 actions)
     } else if (wantOff) {
         phaseNote.add("%sno idle root port to switch off", phaseNote.empty() ? "" : "; ");
     }
+
+    // r8: PEG0 power gating
+    UInt32 wantPeg = actions & kPegMask;
+    if (pegReady) {
+        const char *why = pegSet(wantPeg);
+        phaseNote.add("%s", phaseNote.empty() ? "" : "; ");
+        pegDescribe(phaseNote);
+        if (why != nullptr)
+            phaseNote.add(" (not gated: %s)", why);
+    } else if (wantPeg != 0) {
+        phaseNote.add("%sPEG0 not changed: %s", phaseNote.empty() ? "" : "; ", pegWhy[0] != '\0' ? pegWhy : "not prepared");
+    }
 }
 
-// Puts back what the phases changed: the card's ASPM field and Link Disable on idle root ports.
+// Puts back what the phases changed: PEG0 (r8, first), the card's ASPM field and Link Disable on
+// idle root ports.
 void PkgCProbe::restoreActions()
 {
+    if (pegApplied != 0)
+        pegSet(0);
     if (wifiOn)
         wifiSet(false);
     if (idleOff)
@@ -1895,6 +2302,7 @@ void PkgCProbe::beginTest()
     describeIo();
     wifiPrepare();
     idlePrepare();
+    pegPrepare();                            // r8
     xhciPrepare();
     state = kRunning;
     phase = 0;
@@ -1964,6 +2372,12 @@ void PkgCProbe::finishTest(const char *why)
         line.add("; root port %02x.%u LNKCTL 0x%04x (before the test 0x%04x)", idlePorts[i].devfn >> 3,
                  idlePorts[i].devfn & 7, link & 0xFFFF, idlePorts[i].original);
     }
+    if (pegReady) {                          // r8: PEG0 after it was put back
+        line.add("; ");
+        pegDescribe(line);
+        line.add(" (before the test: PMCSR 0x%04x, buses 0x%08x, 0xC20 0x%08x, 0xC38 0x%08x)", pegPmcsr & 0xFFFF,
+                 pegBusNumbers, pegC20, pegC38);
+    }
     if (ahci != nullptr && ahciPort >= 0)
         line.add("; SATA link %s", linkStateName((portRegs()[kPxSSTS / 4] >> 8) & 0xF));
     addResult(line.c_str());
@@ -1979,6 +2393,11 @@ void PkgCProbe::finishTest(const char *why)
         if (timer != nullptr)
             timer->setTimeoutMS(kKeepCheckMS);
     }
+    // r8: keep PEG0 gated for a while for pkgc2.sh's pmtel windows (not with WifiL1: one timer)
+    if (awake && holdSeconds > 0 && pegReady && !keepWifiL1)
+        startHold();
+    else
+        pegRelease();
 }
 
 void PkgCProbe::applyFix(const char *when)
@@ -2010,6 +2429,10 @@ void PkgCProbe::onTimer()
         stepTest();
         break;
     default:
+        if (holding) {                       // r8: the only timer while holding
+            endHold("hold time over");
+            break;
+        }
         if (applyPending)
             applyFix("after wake");
         if (keepWifiL1) {
@@ -2051,6 +2474,9 @@ IOReturn PkgCProbe::setAwakeAction(OSObject *owner, void *arg0, void *arg1, void
             self->setProperty("State", "skipped");
             self->setProperty("Phase", "skipped");
         }
+        // r8: PEG0 back as found before the Mac sleeps (the firmware powers the dGPU on in _PTS)
+        if (self->holding)
+            self->endHold("the Mac went to sleep");
     } else {
         self->awake = true;
         if (self->state == kDone && self->applyMask != 0 && self->writable)
@@ -2083,5 +2509,40 @@ IOReturn PkgCProbe::powerMessage(void *target, void *refCon, UInt32 messageType,
     default:
         break;
     }
+    return kIOReturnSuccess;
+}
+
+// r8: shutdown or restart. Like a sleep: ends a running test or the hold, so that PEG0 is put back
+// before the firmware's _PTS powers the dGPU on. ApplyMask, WifiL1 and the hold are not used again.
+IOReturn PkgCProbe::shutdownAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3)
+{
+    (void)arg0; (void)arg1; (void)arg2; (void)arg3;
+    PkgCProbe *self = OSDynamicCast(PkgCProbe, owner);
+    if (self == nullptr)
+        return kIOReturnSuccess;
+    self->awake = false;
+    self->applyPending = false;
+    if (self->timer != nullptr)
+        self->timer->cancelTimeout();
+    if (self->state == kRunning)
+        self->finishTest("stopped: the Mac is shutting down or restarting");
+    else if (self->state == kWaiting)
+        self->state = kDone;
+    if (self->holding)
+        self->endHold("the Mac is shutting down or restarting");
+    return kIOReturnSuccess;
+}
+
+// r8: root domain priority messages. Only shutdown and restart are handled (sleep and wake come
+// through powerMessage); every message is acknowledged at once.
+IOReturn PkgCProbe::shutdownMessage(void *target, void *refCon, UInt32 messageType,
+                                    IOService *provider, void *messageArgument, vm_size_t argSize)
+{
+    (void)refCon; (void)provider; (void)messageArgument; (void)argSize;
+    PkgCProbe *self = static_cast<PkgCProbe *>(target);
+    if (self == nullptr || self->workLoop == nullptr)
+        return kIOReturnSuccess;
+    if (messageType == kIOMessageSystemWillPowerOff || messageType == kIOMessageSystemWillRestart)
+        self->workLoop->runAction(&PkgCProbe::shutdownAction, self);
     return kIOReturnSuccess;
 }
