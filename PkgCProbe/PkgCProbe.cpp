@@ -42,6 +42,23 @@
  * (6) Optional WifiL1 (default false): after the test (or StartDelay seconds after start if
  *     RunTest is false) set the card's L1 enable, check it every 30 s and set it again when
  *     AirportItlwm has cleared it (it does so whenever it starts the card, e.g. after a wake).
+ *
+ * r7: r6 found all four devices on the chipset xHCI in U0 in every sample, and macOS never
+ * suspends them. r7 is meant for a boot in which the internal USB devices are not enumerated
+ * (a test USB map), so that the earlier changes can be tried again with the xHCI idle.
+ * (1) The phases add one change at a time: daily setting; + Wi-Fi L1; + all LTRs ignored;
+ *     + Link Disable on idle ports; + PEG0 lanes and bundles power gated; daily setting again.
+ * (2) Idle ports now also include the CPU's PEG0 port (00:01.0, 8086:1901) when it has no
+ *     device and no link (the dGPU is switched off by ACPI).
+ * (3) PEG0 gating follows the firmware's own non-Windows-10 dGPU power-off path (PGOF in the
+ *     OEM SSDT): after Link Disable, wait up to 300 ms for the LTSSM state (0xC74 bits 3:0) to
+ *     be 8, then set 0xC38 bit 3, 0xC20 bits 5:4 = 3 and bit 31 of the bundle registers
+ *     0x91C-0x9FC. With _OSI "Windows 2015" (as SSDT-OC-XOSI answers) the firmware takes the
+ *     other path, which only asks for L2/L3 and leaves the port ungated. Put back in the order
+ *     of PGON (0xC20, 0xC38, bundles) before Link Disable is cleared. Only if the L2/L3
+ *     handshake is done (0x248 bit 14).
+ * (4) USB: connected ports that are neither in U0, U2 nor U3 (for example not enabled because
+ *     the port is not in the USB map) are counted as "other".
  */
 
 #include <IOKit/IOService.h>
@@ -121,6 +138,18 @@ constexpr unsigned kMaxIdlePorts = 8;
 constexpr unsigned kMaxUsbPorts = 32;
 constexpr UInt8  kPchXhciDevFn = 0x14 << 3;      // 00:14.0
 
+// r7: the CPU's PCIe graphics port PEG0 (00:01.0) and the registers of the firmware's PGOF/PGON
+constexpr int    kPegDevFn       = 0x08;          // 00:01.0
+constexpr UInt32 kPegId          = 0x19018086;    // Skylake/Kaby Lake PEG10 (x16)
+constexpr UInt32 kPegL23         = 0x248;         // bit 14: L2/L3 handshake done
+constexpr UInt32 kPegC20         = 0xC20;         // bits 5:4 (P0AP in the SSDT)
+constexpr UInt32 kPegC38         = 0xC38;         // bit 3 (P0RM)
+constexpr UInt32 kPegLtssm       = 0xC74;         // bits 3:0 (P0LT): LTSSM state, 8 = disabled
+const UInt32 kPegBundleRegs[] = {0x91C, 0x93C, 0x95C, 0x97C, 0x99C, 0x9BC, 0x9DC, 0x9FC};   // BSP1-BSP8
+constexpr unsigned kPegBundleCount = sizeof(kPegBundleRegs) / sizeof(kPegBundleRegs[0]);
+constexpr UInt32 kPegLtssmDisabled = 8;
+constexpr UInt32 kPegWaitMS      = 300;           // LDLY in the SSDT (0x12C ms)
+
 struct LtrBlock {
     const char *name;
     UInt32 offset;
@@ -151,11 +180,12 @@ const char *const kPfearNames[kPpfearBytes * 8] = {
 const unsigned kGatedShown[] = {1, 3, 4, 5, 6, 8, 9};      // OPI-DMI, XHCI, SPA, SPB, SPC, SATA, HDA-PGD0
 constexpr unsigned kGatedCount = sizeof(kGatedShown) / sizeof(kGatedShown[0]);
 
-// r6: what a phase does besides the ignore register
+// What a phase does besides the ignore register
 enum PhaseAction : UInt32 {
     kAsFound      = 0,
     kWifiL1       = 1u << 0,    // ASPM L1 enable on the Wi-Fi card (root port already has L1)
-    kIdlePortsOff = 1u << 1,    // Link Disable on PCH root ports with no device and no link
+    kIdlePortsOff = 1u << 1,    // Link Disable on ports (PCH root ports, PEG0) with no device and no link
+    kPegGate      = 1u << 2,    // r7: PEG0 lanes and bundles power gated (only with its link disabled)
 };
 
 struct Phase {
@@ -164,13 +194,14 @@ struct Phase {
     const char *name;
 };
 
+// r7: each phase adds one change to the one before
 const Phase kPhases[] = {
-    {kIgnoreSATA, kAsFound,                "ignore SATA (daily setting)"},
-    {kIgnoreSATA, kWifiL1,                 "ignore SATA + Wi-Fi L1"},
-    {kIgnoreAll,  kWifiL1,                 "ignore all + Wi-Fi L1"},
-    {kIgnoreAll,  kWifiL1 | kIdlePortsOff, "ignore all + Wi-Fi L1 + idle root ports off"},
-    {kIgnoreAll,  kIdlePortsOff,           "ignore all + idle root ports off (Wi-Fi as found)"},
-    {kIgnoreSATA, kAsFound,                "ignore SATA (daily setting) again"},
+    {kIgnoreSATA, kAsFound,                           "ignore SATA (daily setting)"},
+    {kIgnoreSATA, kWifiL1,                            "ignore SATA + Wi-Fi L1"},
+    {kIgnoreAll,  kWifiL1,                            "ignore all + Wi-Fi L1"},
+    {kIgnoreAll,  kWifiL1 | kIdlePortsOff,            "ignore all + Wi-Fi L1 + idle ports off"},
+    {kIgnoreAll,  kWifiL1 | kIdlePortsOff | kPegGate, "ignore all + Wi-Fi L1 + idle ports off + PEG0 gated"},
+    {kIgnoreSATA, kAsFound,                           "ignore SATA (daily setting) again"},
 };
 constexpr unsigned kPhaseCount = sizeof(kPhases) / sizeof(kPhases[0]);
 
@@ -449,7 +480,7 @@ public:
 private:
     enum State { kIdle, kWaiting, kRunning, kDone };
 
-    // r6: a PCH root port without device and link, and its Link Control before the test
+    // r6: a root port without device and link (r7: also PEG0), and its Link Control before the test
     struct IdlePort {
         IOPCIDevice *port;
         UInt8 cap;
@@ -527,6 +558,20 @@ private:
     bool idleChecked {false};
     bool idleOff {false};
 
+    // r7: PEG0 lane and bundle power gating, through the ECAM window of 00:01.0
+    IOMemoryMap *pegMap {nullptr};
+    volatile UInt32 *pegCfg {nullptr};
+    int pegIdle {-1};                        // index of PEG0 in idlePorts, or -1
+    UInt32 pegC20 {0};                       // values before the test
+    UInt32 pegC38 {0};
+    UInt32 pegBundle[kPegBundleCount] {};
+    bool pegChecked {false};
+    bool pegReady {false};
+    bool pegGated {false};
+    UInt32 pegLtssmSeen {0};                 // LTSSM state when the gating was written
+    UInt32 pegWaited {0};                    // ms waited for LTSSM 8 after Link Disable
+    char pegWhy[120] {};
+
     // r6: the chipset xHCI's port states during a phase
     IOMemoryMap *xhciMap {nullptr};
     volatile UInt32 *xhciRegs {nullptr};
@@ -537,6 +582,7 @@ private:
     UInt32 usbU0[kMaxUsbPorts] {};
     UInt32 usbU2[kMaxUsbPorts] {};
     UInt32 usbU3[kMaxUsbPorts] {};
+    UInt32 usbOther[kMaxUsbPorts] {};        // r7: connected, but neither U0, U2 nor U3
 
     PcpLine phaseNote;
 
@@ -564,6 +610,10 @@ private:
     void idlePrepare();
     void idleSet(bool off);
     void idleRelease();
+    void pegPrepare();
+    const char *pegGate(bool on);
+    void pegDescribe(PcpLine &line, volatile UInt32 *cfg);
+    void pegRelease();
     void xhciPrepare();
     void xhciRelease();
     void applyActions(UInt32 actions);
@@ -694,6 +744,7 @@ void PkgCProbe::releaseResources()
     }
     state = kDone;
     xhciRelease();
+    pegRelease();
     idleRelease();
     wifiForget();
     if (ahciMap != nullptr) {
@@ -802,7 +853,7 @@ void PkgCProbe::describeStart()
     PcpLine line;
     UInt32 regs[4];
     pcpCpuid(1, regs);
-    line.add("r6; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
+    line.add("r7; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
     if (pwrm == nullptr)
         line.add("; no PMC LTR registers found there or at 0x%08x: read-only, nothing will be changed", kPwrmDefault);
     else
@@ -1417,7 +1468,7 @@ void PkgCProbe::idlePrepare()
         return;
     idleChecked = true;
     PcpLine line;
-    line.add("Idle root ports (no device, no link):");
+    line.add("Idle ports (no device, no link):");
     IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
     OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
     if (children != nullptr) {
@@ -1427,8 +1478,9 @@ void PkgCProbe::idlePrepare()
             if (port == nullptr)
                 continue;
             int devfn = pciDevFn(port);
-            if (devfn < (0x1B << 3) || devfn >= (0x1E << 3) ||
-                (port->configRead32(kPciClassConfig) >> 8) != kBridgeClass)
+            bool pchPort = devfn >= (0x1B << 3) && devfn < (0x1E << 3);
+            bool pegPort = devfn == kPegDevFn && port->configRead32(0x00) == kPegId;     // r7
+            if ((!pchPort && !pegPort) || (port->configRead32(kPciClassConfig) >> 8) != kBridgeClass)
                 continue;
             UInt8 cap = findCapability(port, 0x10);
             if (cap == 0)
@@ -1495,6 +1547,159 @@ void PkgCProbe::idleRelease()
     idleOff = false;
 }
 
+// r7: the PEG0 registers of the firmware's power-off sequence. Only reads.
+void PkgCProbe::pegDescribe(PcpLine &line, volatile UInt32 *cfg)
+{
+    unsigned gated = 0;
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        gated += (cfg[kPegBundleRegs[i] / 4] >> 31) & 1;
+    UInt32 l23 = cfg[kPegL23 / 4];
+    UInt32 c20 = cfg[kPegC20 / 4];
+    UInt32 c38 = cfg[kPegC38 / 4];
+    UInt32 ltssm = cfg[kPegLtssm / 4] & 0xF;
+    line.add(" 0x248 0x%08x, 0xC20 0x%08x, 0xC38 0x%08x, LTSSM %u, bundles gated %u/%u",
+             l23, c20, c38, ltssm, gated, kPegBundleCount);
+}
+
+// r7: decides once whether the last test phase may power gate PEG0's lanes and bundles, and keeps
+// the values to put back. Only reads. Needs PEG0 among the idle ports (8086:1901, no device behind
+// it, no link), its ECAM window, and the L2/L3 handshake done (0x248 bit 14).
+void PkgCProbe::pegPrepare()
+{
+    if (pegChecked)
+        return;
+    pegChecked = true;
+    pegReady = false;
+    pegGated = false;
+    pegWhy[0] = '\0';
+    pegIdle = -1;
+    for (unsigned i = 0; i < idleCount; i++) {
+        if (idlePorts[i].port != nullptr && idlePorts[i].devfn == kPegDevFn)
+            pegIdle = static_cast<int>(i);
+    }
+
+    IOPCIDevice *host = nullptr;
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children != nullptr) {
+        OSObject *child = nullptr;
+        while (host == nullptr && (child = children->getNextObject()) != nullptr) {
+            IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
+            if (device != nullptr && pciDevFn(device) == 0)
+                host = device;
+        }
+    }
+    UInt64 ecam = ecamBase(host);
+    if (children != nullptr)
+        children->release();
+
+    IOMemoryMap *mapping = nullptr;
+    volatile UInt32 *cfg = nullptr;
+    if (ecam != 0) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(ecam + (static_cast<UInt64>(kPegDevFn) << 12), kMapLength);
+        if (memory != nullptr) {
+            mapping = memory->map(kIOMapInhibitCache);
+            memory->release();
+        }
+        if (mapping != nullptr)
+            cfg = reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress());
+    }
+
+    const char *why = nullptr;
+    if (cfg == nullptr)
+        why = "ECAM not mapped";
+    else if (cfg[0] != kPegId)
+        why = "no 8086:1901 at 00:01.0";
+    else if (pegIdle < 0)
+        why = "PEG0 is not an idle port (device behind it, link up, or link already disabled)";
+    else if (!writable)
+        why = "read-only mode";
+    else if (((cfg[kPegL23 / 4] >> 14) & 1) == 0)
+        why = "L2/L3 handshake not done (0x248 bit 14 is 0)";
+
+    PcpLine line;
+    line.add("PEG0 00:01.0:");
+    if (cfg != nullptr && cfg[0] == kPegId)
+        pegDescribe(line, cfg);
+    if (why != nullptr) {
+        snprintf(pegWhy, sizeof(pegWhy), "%s", why);
+        line.add("; gating not used: %s", why);
+        if (mapping != nullptr)
+            mapping->release();
+        addResult(line.c_str());
+        return;
+    }
+    pegMap = mapping;
+    pegCfg = cfg;
+    pegC20 = cfg[kPegC20 / 4];
+    pegC38 = cfg[kPegC38 / 4];
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        pegBundle[i] = cfg[kPegBundleRegs[i] / 4];
+    pegReady = true;
+    line.add("; gating ready (only after Link Disable, as the firmware's non-Windows-10 power-off)");
+    addResult(line.c_str());
+}
+
+// r7: on: power gates PEG0's lanes and bundles in the order of the firmware's PGOF (0xC38 bit 3,
+// 0xC20 bits 5:4 = 3, bundle bit 31), only while PEG0's link is disabled, after waiting up to
+// 300 ms for its LTSSM to report Disabled (8), as PGOF does. off: puts the values back in the order
+// of PGON (0xC20, 0xC38, bundles); call it before Link Disable is cleared.
+// Returns nullptr on success, otherwise why nothing was written.
+const char *PkgCProbe::pegGate(bool on)
+{
+    if (!pegReady || pegCfg == nullptr)
+        return pegWhy[0] != '\0' ? pegWhy : "not prepared";
+    if (!on) {
+        if (!pegGated)
+            return nullptr;
+        pegCfg[kPegC20 / 4] = pegC20;
+        pegCfg[kPegC38 / 4] = pegC38;
+        for (unsigned i = 0; i < kPegBundleCount; i++)
+            pegCfg[kPegBundleRegs[i] / 4] = pegBundle[i];
+        pegGated = false;
+        return nullptr;
+    }
+    if (pegGated)
+        return nullptr;
+    if (pegIdle < 0 || !idleOff)
+        return "PEG0 link is not disabled";
+    IdlePort &entry = idlePorts[pegIdle];
+    if (entry.port == nullptr || entry.port->isInactive())
+        return "PEG0 is gone";
+    UInt32 link = entry.port->configRead32(static_cast<UInt8>(entry.cap + kExpLinkCtl));
+    if (link == 0xFFFFFFFF || (link & kLinkDisable) == 0)
+        return "PEG0 link is not disabled";
+    if (pegCfg[0] != kPegId)
+        return "PEG0 not readable";
+    // As PGOF: wait up to 300 ms for the LTSSM to report Disabled, then go on in any case.
+    UInt32 waited = 0;
+    while ((pegCfg[kPegLtssm / 4] & 0xF) != kPegLtssmDisabled && waited < kPegWaitMS) {
+        IOSleep(10);
+        waited += 10;
+    }
+    pegLtssmSeen = pegCfg[kPegLtssm / 4] & 0xF;
+    pegWaited = waited;
+    pegCfg[kPegC38 / 4] = pegC38 | 0x8u;
+    pegCfg[kPegC20 / 4] = (pegC20 & ~0x30u) | 0x30u;
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        pegCfg[kPegBundleRegs[i] / 4] = pegBundle[i] | 0x80000000u;
+    pegGated = true;
+    return nullptr;
+}
+
+void PkgCProbe::pegRelease()
+{
+    pegReady = false;
+    pegGated = false;
+    pegCfg = nullptr;
+    if (pegMap != nullptr) {
+        pegMap->release();
+        pegMap = nullptr;
+    }
+    pegIdle = -1;
+    pegChecked = false;
+}
+
 // r6: maps the chipset xHCI (00:14.0) registers to count its port states during the phases. Read only.
 void PkgCProbe::xhciPrepare()
 {
@@ -1558,10 +1763,13 @@ void PkgCProbe::applyActions(UInt32 actions)
     }
 
     bool wantOff = (actions & kIdlePortsOff) != 0;
+    bool wantGate = (actions & kPegGate) != 0;
+    if (pegGated && (!wantGate || !wantOff))
+        pegGate(false);                      // r7: before Link Disable is cleared, as the firmware's PGON
     if (idleCount > 0) {
         if (wantOff != idleOff)
             idleSet(wantOff);
-        phaseNote.add("%sidle root ports:", phaseNote.empty() ? "" : "; ");
+        phaseNote.add("%sidle ports:", phaseNote.empty() ? "" : "; ");
         for (unsigned i = 0; i < idleCount; i++) {
             if (idlePorts[i].port == nullptr)
                 continue;
@@ -1570,13 +1778,26 @@ void PkgCProbe::applyActions(UInt32 actions)
                           link == 0xFFFFFFFF ? "unreadable" : ((link & kLinkDisable) != 0 ? "link disabled" : "as found"));
         }
     } else if (wantOff) {
-        phaseNote.add("%sno idle root port to switch off", phaseNote.empty() ? "" : "; ");
+        phaseNote.add("%sno idle port to switch off", phaseNote.empty() ? "" : "; ");
+    }
+    if (wantGate) {
+        const char *why = pegGate(true);
+        if (why != nullptr)
+            phaseNote.add("%sPEG0 not gated: %s", phaseNote.empty() ? "" : "; ", why);
+    }
+    if (pegGated && pegCfg != nullptr) {
+        phaseNote.add("%sPEG0 gated (LTSSM %u after %u ms of Link Disable):", phaseNote.empty() ? "" : "; ",
+                      pegLtssmSeen, pegWaited);
+        pegDescribe(phaseNote, pegCfg);
     }
 }
 
-// Puts back what the phases changed: the card's ASPM field and Link Disable on idle root ports.
+// Puts back what the phases changed: PEG0 gating (r7, first), the card's ASPM field and Link
+// Disable on idle ports.
 void PkgCProbe::restoreActions()
 {
+    if (pegGated)
+        pegGate(false);
     if (wifiOn)
         wifiSet(false);
     if (idleOff)
@@ -1634,7 +1855,7 @@ void PkgCProbe::resetSamples()
     for (unsigned i = 0; i < kGatedCount; i++)
         gatedCount[i] = 0;
     for (unsigned i = 0; i < kMaxUsbPorts; i++)
-        usbSeen[i] = usbU0[i] = usbU2[i] = usbU3[i] = 0;
+        usbSeen[i] = usbU0[i] = usbU2[i] = usbU3[i] = usbOther[i] = 0;
     limitMin = 0xFF;
     limitMax = 0;
     samples = 0;
@@ -1699,7 +1920,7 @@ void PkgCProbe::sample(UInt32 ignored)
             case 0: usbU0[n]++; break;
             case 2: usbU2[n]++; break;
             case 3: usbU3[n]++; break;
-            default: break;
+            default: usbOther[n]++; break;
             }
         }
     }
@@ -1767,13 +1988,13 @@ void PkgCProbe::report(const PcpSnapshot &last)
         line.add(" | SATA link active %u, partial %u, slumber %u, other %u",
                  linkCount[0], linkCount[1], linkCount[2], linkCount[3] + linkCount[4]);
     if (xhciRegs != nullptr && samples > 0) {
-        line.add(" | USB U0/U2/U3 of %u:", samples);
+        line.add(" | USB U0/U2/U3/other of %u:", samples);
         bool any = false;
         for (UInt32 n = 0; n < xhciPorts; n++) {
             if (usbSeen[n] == 0)
                 continue;
             any = true;
-            line.add(" p%u %u/%u/%u", n + 1, usbU0[n], usbU2[n], usbU3[n]);
+            line.add(" p%u %u/%u/%u/%u", n + 1, usbU0[n], usbU2[n], usbU3[n], usbOther[n]);
         }
         if (!any)
             line.add(" no device");
@@ -1800,6 +2021,7 @@ void PkgCProbe::beginTest()
     describeIo();
     wifiPrepare();
     idlePrepare();
+    pegPrepare();
     xhciPrepare();
     state = kRunning;
     phase = 0;
@@ -1859,13 +2081,23 @@ void PkgCProbe::finishTest(const char *why)
         if (idlePorts[i].port == nullptr)
             continue;
         UInt32 link = idlePorts[i].port->configRead32(static_cast<UInt8>(idlePorts[i].cap + kExpLinkCtl));
-        line.add("; root port %02x.%u LNKCTL 0x%04x (before the test 0x%04x)", idlePorts[i].devfn >> 3,
+        line.add("; port %02x.%u LNKCTL 0x%04x (before the test 0x%04x)", idlePorts[i].devfn >> 3,
                  idlePorts[i].devfn & 7, link & 0xFFFF, idlePorts[i].original);
+    }
+    if (pegReady && pegCfg != nullptr) {
+        UInt32 c20 = pegCfg[kPegC20 / 4];
+        UInt32 c38 = pegCfg[kPegC38 / 4];
+        unsigned gated = 0;
+        for (unsigned i = 0; i < kPegBundleCount; i++)
+            gated += (pegCfg[kPegBundleRegs[i] / 4] >> 31) & 1;
+        line.add("; PEG0 0xC20 0x%08x, 0xC38 0x%08x, bundles gated %u (before the test 0x%08x, 0x%08x)",
+                 c20, c38, gated, pegC20, pegC38);
     }
     if (ahci != nullptr && ahciPort >= 0)
         line.add("; SATA link %s", linkStateName((portRegs()[kPxSSTS / 4] >> 8) & 0xF));
     addResult(line.c_str());
     xhciRelease();
+    pegRelease();
     if (awake)
         describePpfear("after the test");
     setProperty("State", why);
