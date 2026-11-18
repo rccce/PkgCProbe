@@ -22,28 +22,26 @@
  * r2: PMC registers mapped with IOMemoryDescriptor::map(); AHCI found among the PMC's siblings.
  * r3/r4: DMI (both ends) and the parked PEG0 port were read and tested; both ruled out.
  *
- * r5: (1) The PEG0 and DMI parts are removed.
- * (2) Read-only survey before the test: PCH IP power gating (PPFEAR, PWRMBASE+0x590..0x594,
- *     names as in Linux spt_pfear_map; bit set = gated), every PCH root port and the device
- *     behind it (ASPM, clock PM, LTR enable, L1 substates), the port status of each xHCI
- *     controller (connected ports, speed, link state), the HD Audio streams that are running,
- *     the RTL8111's own ASPM and clock request enables (Config5 bit 0, Config2 bit 7), and
- *     more AHCI port registers (PxIE, PxIS, PxSERR, PxCI, PxSACT).
- * (3) New test phases with SATA aggressive link power management (ALPM). The AHCI driver in
- *     this EFI (CtlnaAHCIPort 341.0.2) contains Apple's own ALPM code: Enable sets PxCMD.ALPE
- *     (the controller puts the idle link into Partial by itself), and while it is on, the
- *     driver's 80 ms inactivity timer moves the idle link on to Slumber. Nothing on this
- *     system calls it. r5 calls the driver's own EnableAggressiveLinkPowerManagement and
- *     DisableAggressiveLinkPowerManagement (vtable 0x878 and 0x880) on the driver's own work
- *     loop, only if the port object is CtlnaIntelPchSeriesAHCIPort, the four ALPM functions
- *     are byte for byte the ones that were checked, the controller supports ALPM, Partial and
- *     Slumber, the port is running with a device, and PhyRdy-change interrupts are off (no hot
- *     plug; then the driver ignores PhyRdy changes). For the Slumber phases it asks once for
- *     Slumber in the same way the driver's timer does (PxCMD.ICC). After the test ALPM is set
- *     back to how it was, the link is woken up, and the PhyRdy-change and Comm-Wake bits this
- *     caused are cleared from PxSERR; also if the Mac sleeps during the test.
- * (4) Optional SataAlpm (default false): keep ALPM on through the driver after the test (or
- *     StartDelay seconds after start if RunTest is false) and 5 s after every wake.
+ * r5: read-only survey (PCH IP power gating, root ports and devices, xHCI ports, HD Audio
+ *     streams, RTL8111 ASPM enables) and SATA ALPM through the AHCI driver. With ALPM on, the
+ *     SATA drive's link never left Active and did not accept Slumber, so r6 drops the ALPM part.
+ *
+ * r6: (1) SATA ALPM removed (the SATA link is still counted in every phase).
+ * (2) Wi-Fi link ASPM L1. AirportItlwm (ItlIwx::iwx_apm_config: "Disable L0s and L1s in PCIE
+ *     register because we don't support ASPM now") clears ASPM L0s and L1 in the card's Link
+ *     Control every time it starts the card, so this link never enters L1 although the root port
+ *     above it allows L1. Test phases set only the card's L1 enable (Link Control bit 1), and only
+ *     if the card is an Intel network controller (class 02.80) behind a PCH root port, in D0, with
+ *     its link up, L1 supported, and L1 already enabled on the root port (which is not touched).
+ *     Afterwards only the card's ASPM field is put back to what it was before the test.
+ * (3) Idle root ports: Link Disable (Link Control bit 4) only on PCH root ports that have no
+ *     device below them and no link (Data Link Layer Link Active 0); put back afterwards.
+ * (4) Every phase also counts, for each connected USB port of the chipset's xHCI, the samples
+ *     in U0 (active), U2 (USB 2 L1) and U3 (suspended). Read only.
+ * (5) Everything is put back after the test, also if the Mac sleeps during the test.
+ * (6) Optional WifiL1 (default false): after the test (or StartDelay seconds after start if
+ *     RunTest is false) set the card's L1 enable, check it every 30 s and set it again when
+ *     AirportItlwm has cleared it (it does so whenever it starts the card, e.g. after a wake).
  */
 
 #include <IOKit/IOService.h>
@@ -104,13 +102,24 @@ constexpr UInt32 kPxSERR  = 0x30;
 constexpr UInt32 kPxSACT  = 0x34;
 constexpr UInt32 kPxCI    = 0x38;
 constexpr UInt32 kPxDEVSLP = 0x44;
-constexpr UInt32 kCmdStart  = 1u << 0;
-constexpr UInt32 kCmdAlpe   = 1u << 26;
-constexpr UInt32 kCmdIccMask = 0xF0000000u;
-constexpr UInt32 kCmdIccActive  = 0x10000000u;
-constexpr UInt32 kCmdIccSlumber = 0x60000000u;
-constexpr UInt32 kIePhyRdy  = 1u << 22;          // PRCE
-constexpr UInt32 kSerrPhyRdyWake = (1u << 16) | (1u << 18);   // DIAG.N (PhyRdy change), DIAG.W (Comm Wake)
+
+// r6: PCI Express capability registers (offsets from the capability) and Link Control bits
+constexpr UInt8  kExpDevCap   = 0x04;
+constexpr UInt8  kExpLinkCap  = 0x0C;
+constexpr UInt8  kExpLinkCtl  = 0x10;            // 16 bits; Link Status is the upper half of the dword
+constexpr UInt8  kExpSlotCap  = 0x14;
+constexpr UInt8  kExpSlotCtl  = 0x18;            // 16 bits; Slot Status is the upper half of the dword
+constexpr UInt8  kExpDevCap2  = 0x24;
+constexpr UInt8  kExpDevCtl2  = 0x28;
+constexpr UInt16 kLinkAspmL0s = 1u << 0;
+constexpr UInt16 kLinkAspmL1  = 1u << 1;
+constexpr UInt16 kLinkDisable = 1u << 4;
+constexpr UInt32 kLinkDllActive = 1u << 29;      // in the Link Control/Status dword
+constexpr UInt32 kWifiClassPrefix = 0x0280;      // network controller, other (Intel Wi-Fi)
+constexpr UInt32 kIntelVendor = 0x8086;
+constexpr unsigned kMaxIdlePorts = 8;
+constexpr unsigned kMaxUsbPorts = 32;
+constexpr UInt8  kPchXhciDevFn = 0x14 << 3;      // 00:14.0
 
 struct LtrBlock {
     const char *name;
@@ -142,77 +151,34 @@ const char *const kPfearNames[kPpfearBytes * 8] = {
 const unsigned kGatedShown[] = {1, 3, 4, 5, 6, 8, 9};      // OPI-DMI, XHCI, SPA, SPB, SPC, SATA, HDA-PGD0
 constexpr unsigned kGatedCount = sizeof(kGatedShown) / sizeof(kGatedShown[0]);
 
-// r5: what a phase does to the SATA link besides the ignore register
-enum SataAction : UInt32 {
-    kSataAsFound = 0,           // ALPM as the AHCI driver had it before the test
-    kSataAlpm    = 1u << 0,     // the driver's EnableAggressiveLinkPowerManagement
-    kSataSlumber = 1u << 1,     // and ask once for Slumber, as the driver's inactivity timer does
+// r6: what a phase does besides the ignore register
+enum PhaseAction : UInt32 {
+    kAsFound      = 0,
+    kWifiL1       = 1u << 0,    // ASPM L1 enable on the Wi-Fi card (root port already has L1)
+    kIdlePortsOff = 1u << 1,    // Link Disable on PCH root ports with no device and no link
 };
 
 struct Phase {
     UInt32 mask;
-    UInt32 sata;
+    UInt32 actions;
     const char *name;
 };
 
 const Phase kPhases[] = {
-    {kIgnoreSATA, kSataAsFound,             "ignore SATA, ALPM as found (daily setting)"},
-    {kIgnoreSATA, kSataAlpm,                "ignore SATA + SATA ALPM"},
-    {kIgnoreSATA, kSataAlpm | kSataSlumber, "ignore SATA + SATA ALPM + Slumber"},
-    {0,           kSataAlpm | kSataSlumber, "nothing ignored + SATA ALPM + Slumber"},
-    {kIgnoreAll,  kSataAlpm | kSataSlumber, "ignore all + SATA ALPM + Slumber"},
-    {kIgnoreSATA, kSataAsFound,             "ignore SATA, ALPM as found again"},
+    {kIgnoreSATA, kAsFound,                "ignore SATA (daily setting)"},
+    {kIgnoreSATA, kWifiL1,                 "ignore SATA + Wi-Fi L1"},
+    {kIgnoreAll,  kWifiL1,                 "ignore all + Wi-Fi L1"},
+    {kIgnoreAll,  kWifiL1 | kIdlePortsOff, "ignore all + Wi-Fi L1 + idle root ports off"},
+    {kIgnoreAll,  kIdlePortsOff,           "ignore all + idle root ports off (Wi-Fi as found)"},
+    {kIgnoreSATA, kAsFound,                "ignore SATA (daily setting) again"},
 };
 constexpr unsigned kPhaseCount = sizeof(kPhases) / sizeof(kPhases[0]);
 
 constexpr UInt32 kTickMS       = 500;
 constexpr UInt32 kSettleTicks  = 4;          // 2 s between changing the settings and measuring
 constexpr UInt32 kWakeApplyMS  = 1000;
-constexpr UInt32 kWakeAlpmMS   = 5000;
-constexpr UInt32 kAlpmRetryMS  = 10000;
+constexpr UInt32 kKeepCheckMS  = 30000;      // WifiL1: how often the card's L1 enable is checked
 constexpr UInt32 kMaxApplyLogs = 3;
-
-// r5: Apple's ALPM functions in CtlnaAHCIPort 341.0.2 (com.apple.driver.CtlnaAHCIPort), as
-// vtable slots of CtlnaAHCIPort / CtlnaIntelPchSeriesAHCIPort (byte offset / 8), and their code.
-// The code uses only the object (flags at +0x169, port registers at +0x138, controller
-// registers at +0x140) and no addresses that the linker changes.
-constexpr const char *kAhciPortClass = "CtlnaIntelPchSeriesAHCIPort";
-constexpr unsigned kSlotAlpmSupport = 0x868 / 8;
-constexpr unsigned kSlotAlpmState   = 0x870 / 8;
-constexpr unsigned kSlotAlpmEnable  = 0x878 / 8;
-constexpr unsigned kSlotAlpmDisable = 0x880 / 8;
-
-const UInt8 kCodeAlpmSupport[] = {   // ReportAggressiveLinkPowerManagementSupport
-    0x55, 0x48, 0x89, 0xe5, 0x8b, 0x8f, 0x69, 0x01, 0x00, 0x00, 0x31, 0xc0, 0xf6, 0xc1, 0x01, 0x74,
-    0x1a, 0xb8, 0x03, 0x00, 0x00, 0x00, 0x0f, 0xba, 0xe1, 0x10, 0x72, 0x0f, 0x48, 0x8b, 0x87, 0x40,
-    0x01, 0x00, 0x00, 0x8b, 0x00, 0xc1, 0xe8, 0x0d, 0x83, 0xe0, 0x03, 0x5d, 0xc3,
-};
-const UInt8 kCodeAlpmState[] = {     // ReportAggressiveLinkPowerManagementState
-    0x55, 0x48, 0x89, 0xe5, 0xf6, 0x87, 0x6b, 0x01, 0x00, 0x00, 0x01, 0x75, 0x2a, 0x48, 0x8b, 0x87,
-    0x38, 0x01, 0x00, 0x00, 0xb9, 0x00, 0x0f, 0x00, 0x00, 0x23, 0x48, 0x28, 0x31, 0xd2, 0x81, 0xf9,
-    0x00, 0x02, 0x00, 0x00, 0x0f, 0x94, 0xc2, 0x81, 0xf9, 0x00, 0x06, 0x00, 0x00, 0xb8, 0x02, 0x00,
-    0x00, 0x00, 0x0f, 0x45, 0xc2, 0x5d, 0xc3, 0x31, 0xc0, 0x5d, 0xc3,
-};
-const UInt8 kCodeAlpmEnable[] = {    // EnableAggressiveLinkPowerManagement
-    0x55, 0x48, 0x89, 0xe5, 0x8b, 0x8f, 0x69, 0x01, 0x00, 0x00, 0xb8, 0xc7, 0x02, 0x00, 0xe0, 0xf6,
-    0xc1, 0x01, 0x74, 0x4c, 0xb8, 0xff, 0xf0, 0xff, 0xff, 0x0f, 0xba, 0xe1, 0x10, 0x72, 0x20, 0x48,
-    0x8b, 0x8f, 0x38, 0x01, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x04, 0x0b, 0x51, 0x18, 0xb8, 0xff,
-    0xf0, 0xff, 0xff, 0x23, 0x41, 0x2c, 0x89, 0x51, 0x18, 0x8b, 0x8f, 0x69, 0x01, 0x00, 0x00, 0x0f,
-    0xba, 0xe1, 0x10, 0x72, 0x10, 0x48, 0x8b, 0x8f, 0x38, 0x01, 0x00, 0x00, 0x89, 0x41, 0x2c, 0x8b,
-    0x8f, 0x69, 0x01, 0x00, 0x00, 0x83, 0xc9, 0x02, 0x89, 0x8f, 0x69, 0x01, 0x00, 0x00, 0x31, 0xc0,
-    0x5d, 0xc3,
-};
-const UInt8 kCodeAlpmDisable[] = {   // DisableAggressiveLinkPowerManagement
-    0x55, 0x48, 0x89, 0xe5, 0x8b, 0x8f, 0x69, 0x01, 0x00, 0x00, 0xb8, 0xc7, 0x02, 0x00, 0xe0, 0xf6,
-    0xc1, 0x01, 0x74, 0x25, 0x0f, 0xba, 0xe1, 0x10, 0x72, 0x14, 0x48, 0x8b, 0x87, 0x38, 0x01, 0x00,
-    0x00, 0x81, 0x60, 0x18, 0xff, 0xff, 0xff, 0xfb, 0x8b, 0x8f, 0x69, 0x01, 0x00, 0x00, 0x83, 0xe1,
-    0xfd, 0x89, 0x8f, 0x69, 0x01, 0x00, 0x00, 0x31, 0xc0, 0x5d, 0xc3,
-};
-
-// Results of the Slumber request
-enum SlumberResult : UInt32 {
-    kSlumberReached = 0, kSlumberBusy = 1, kSlumberNotActive = 2, kSlumberTimeout = 3, kSlumberAlready = 4,
-};
 
 // MSRs used; all exist on Skylake/Kaby Lake client CPUs (family 6, models 4E/5E/8E/9E).
 constexpr UInt32 kMsrPkgCstConfig = 0xE2;
@@ -303,18 +269,6 @@ const char *linkStateName(UInt32 ipm)
     }
 }
 
-const char *slumberName(UInt32 result)
-{
-    switch (result) {
-    case kSlumberReached:   return "reached";
-    case kSlumberBusy:      return "not asked: commands outstanding";
-    case kSlumberNotActive: return "not asked: link not active";
-    case kSlumberTimeout:   return "not reached within 5 ms";
-    case kSlumberAlready:   return "already in Slumber";
-    default:                return "not asked: driver work loop not available";
-    }
-}
-
 const char *usbSpeedName(UInt32 speed)
 {
     static const char *const names[] = {"?", "FS", "LS", "HS", "SS", "SS+"};
@@ -339,43 +293,18 @@ const char *aspmName(UInt32 bits)
     return names[bits & 3];
 }
 
-bool sameText(const char *a, const char *b)
+// PCIe Link Capabilities bits 17:15 (L1 exit latency) and Device Capabilities bits 11:9
+// (endpoint L1 acceptable latency).
+const char *l1ExitName(UInt32 code)
 {
-    if (a == nullptr || b == nullptr)
-        return false;
-    while (*a != '\0' && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;
+    static const char *const names[] = {"<1 us", "1-2 us", "2-4 us", "4-8 us", "8-16 us", "16-32 us", "32-64 us", ">64 us"};
+    return names[code & 7];
 }
 
-// "2" -> 2; anything that is not a plain decimal number -> -1
-int decimalValue(const char *text)
+const char *l1AcceptName(UInt32 code)
 {
-    if (text == nullptr || *text == '\0')
-        return -1;
-    int value = 0;
-    for (; *text != '\0'; text++) {
-        if (*text < '0' || *text > '9' || value > 1000)
-            return -1;
-        value = value * 10 + (*text - '0');
-    }
-    return value;
-}
-
-// True if the code at function is exactly expected (only kernel addresses are read).
-bool sameCode(const void *function, const UInt8 *expected, size_t length)
-{
-    uintptr_t address = reinterpret_cast<uintptr_t>(function);
-    if (address < 0xFFFFFF8000000000ULL)
-        return false;
-    const volatile UInt8 *code = static_cast<const volatile UInt8 *>(function);
-    for (size_t i = 0; i < length; i++) {
-        if (code[i] != expected[i])
-            return false;
-    }
-    return true;
+    static const char *const names[] = {"1 us", "2 us", "4 us", "8 us", "16 us", "32 us", "64 us", "no limit"};
+    return names[code & 7];
 }
 
 // Device and function of a PCI device on bus 0 from its "reg" property ((device << 3) | function), or -1.
@@ -482,9 +411,15 @@ public:
     }
 
     const char *c_str() const { return text; }
+    bool empty() const { return length == 0; }
+    void clear()
+    {
+        text[0] = '\0';
+        length = 0;
+    }
 
 private:
-    char text[1024];
+    char text[1536];
     size_t length {0};
 };
 
@@ -513,8 +448,14 @@ public:
 
 private:
     enum State { kIdle, kWaiting, kRunning, kDone };
-    enum AlpmCall : UInt32 { kCallEnable = 1, kCallDisable = 2, kCallSlumber = 3 };
-    typedef UInt32 (*PortFunction)(IOService *port);
+
+    // r6: a PCH root port without device and link, and its Link Control before the test
+    struct IdlePort {
+        IOPCIDevice *port;
+        UInt8 cap;
+        int devfn;
+        UInt16 original;
+    };
 
     IOPCIDevice *pmc {nullptr};
     IOMemoryMap *pwrmMap {nullptr};
@@ -540,7 +481,7 @@ private:
     UInt32 phaseSeconds {15};
     UInt32 applyMask {0};
     bool runTest {true};
-    bool keepAlpm {false};
+    bool keepWifiL1 {false};
 
     State state {kIdle};
     bool awake {true};
@@ -558,29 +499,46 @@ private:
     UInt64 aggregatedMax {0};
     UInt64 lowestCounted {kNone};
     int lowestBy {-1};
-    UInt32 linkCount[5] {};                  // active, partial, slumber, devsleep, other
+    UInt32 linkCount[5] {};                  // SATA link: active, partial, slumber, devsleep, other
     UInt32 gatedCount[kGatedCount] {};       // samples with the IP power gated
     UInt32 limitMin {0xFF};
     UInt32 limitMax {0};
     UInt32 samples {0};
 
-    // r5: SATA ALPM through the AHCI driver
-    IOService *alpmPort {nullptr};
-    PortFunction alpmSupport {nullptr};
-    PortFunction alpmState {nullptr};
-    PortFunction alpmEnable {nullptr};
-    PortFunction alpmDisable {nullptr};
-    bool alpmChecked {false};
-    bool alpmReady {false};
-    bool alpmWasOn {false};
-    bool alpmOn {false};
-    bool alpmPending {false};
-    UInt32 alpmWaitMS {0};
-    UInt32 alpmKeepCount {0};
-    UInt32 alpmRetries {0};
-    const char *alpmWhen {"at start"};
-    char alpmWhy[120] {};
-    char alpmNote[240] {};
+    // r6: Intel Wi-Fi card and the root port above it (both retained)
+    IOPCIDevice *wifiPort {nullptr};
+    IOPCIDevice *wifiDevice {nullptr};
+    UInt8 wifiPortCap {0};
+    UInt8 wifiCap {0};
+    UInt8 wifiPm {0};
+    int wifiPortDevFn {-1};
+    UInt32 wifiBus {0};
+    UInt16 wifiOriginal {0};                 // the card's Link Control before the test
+    bool wifiChecked {false};
+    bool wifiReady {false};
+    bool wifiOn {false};                     // the test has set the card's L1 enable
+    UInt32 wifiKeepCount {0};
+    const char *keepWhen {"check"};
+    char wifiWhy[120] {};
+
+    // r6: idle root ports (retained)
+    IdlePort idlePorts[kMaxIdlePorts] {};
+    unsigned idleCount {0};
+    bool idleChecked {false};
+    bool idleOff {false};
+
+    // r6: the chipset xHCI's port states during a phase
+    IOMemoryMap *xhciMap {nullptr};
+    volatile UInt32 *xhciRegs {nullptr};
+    UInt64 xhciSize {0};
+    UInt32 xhciCapLength {0};
+    UInt32 xhciPorts {0};
+    UInt32 usbSeen[kMaxUsbPorts] {};
+    UInt32 usbU0[kMaxUsbPorts] {};
+    UInt32 usbU2[kMaxUsbPorts] {};
+    UInt32 usbU3[kMaxUsbPorts] {};
+
+    PcpLine phaseNote;
 
     UInt32 readPwrm(UInt32 offset) const { return pwrm[offset / 4]; }
     volatile UInt32 *portRegs() const { return ahci + (0x100 + ahciPort * 0x80) / 4; }
@@ -598,20 +556,23 @@ private:
     void describeXhci(IOPCIDevice *device, const char *label);
     void describeHda(IOPCIDevice *device);
     void describeRealtek(IOPCIDevice *device, UInt32 bus);
-    IOService *findAhciPortService();
-    bool alpmPrepare();
-    UInt32 alpmRun(UInt32 call);
-    UInt32 slumberGated();
-    void wakeLinkGated();
-    void sataApply(UInt32 action);
-    void alpmRestore();
-    void alpmKeep();
+    bool wifiPrepare();
+    void wifiForget();
+    UInt16 wifiControl();
+    const char *wifiSet(bool on);
+    void wifiKeep(const char *when);
+    void idlePrepare();
+    void idleSet(bool off);
+    void idleRelease();
+    void xhciPrepare();
+    void xhciRelease();
+    void applyActions(UInt32 actions);
+    void restoreActions();
     void writeIgnore(UInt32 value);
     void takeSnapshot(PcpSnapshot *snapshot);
     void resetSamples();
     void sample(UInt32 ignored);
     void addRange(PcpLine &line, UInt64 low, UInt64 high);
-    void addBusDelay(PcpLine &line);
     void report(const PcpSnapshot &last);
     void beginTest();
     void stepTest();
@@ -622,7 +583,6 @@ private:
 
     static void timerAction(OSObject *owner, IOTimerEventSource *sender);
     static IOReturn setAwakeAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
-    static IOReturn alpmAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
     static IOReturn powerMessage(void *target, void *refCon, UInt32 messageType,
                                  IOService *provider, void *messageArgument, vm_size_t argSize);
 };
@@ -687,11 +647,9 @@ bool PkgCProbe::start(IOService *provider)
         setProperty("State", "no test");
         if (applyMask != 0)
             applyFix("at start");
-        if (keepAlpm) {
-            alpmPending = true;
-            alpmWaitMS = 0;
-            alpmWhen = "at start";
-            timer->setTimeoutMS(startDelay * 1000);
+        if (keepWifiL1) {
+            keepWhen = "at start";
+            timer->setTimeoutMS(startDelay * 1000);   // the first WifiL1 check, then every 30 s
         }
     }
     return true;
@@ -727,19 +685,17 @@ void PkgCProbe::releaseResources()
         workLoop = nullptr;
     }
     // Nothing runs on our work loop any more: put back what a test that was cut short changed.
-    if (alpmReady && alpmOn && !alpmWasOn)
-        alpmRestore();
-    if (state == kRunning && ignoreChanged && writable && pwrm != nullptr) {
-        pwrm[kLtrIgnore / 4] = ignoreOriginal;
-        ignoreChanged = false;
+    if (state == kRunning) {
+        restoreActions();
+        if (ignoreChanged && writable && pwrm != nullptr) {
+            pwrm[kLtrIgnore / 4] = ignoreOriginal;
+            ignoreChanged = false;
+        }
     }
     state = kDone;
-    alpmReady = false;
-    alpmSupport = alpmState = alpmEnable = alpmDisable = nullptr;
-    if (alpmPort != nullptr) {
-        alpmPort->release();
-        alpmPort = nullptr;
-    }
+    xhciRelease();
+    idleRelease();
+    wifiForget();
     if (ahciMap != nullptr) {
         ahciMap->release();
         ahciMap = nullptr;
@@ -836,9 +792,9 @@ void PkgCProbe::readOptions()
     OSBoolean *flag = OSDynamicCast(OSBoolean, getProperty("RunTest"));
     if (flag != nullptr)
         runTest = flag->isTrue();
-    flag = OSDynamicCast(OSBoolean, getProperty("SataAlpm"));
+    flag = OSDynamicCast(OSBoolean, getProperty("WifiL1"));
     if (flag != nullptr)
-        keepAlpm = flag->isTrue();
+        keepWifiL1 = flag->isTrue();
 }
 
 void PkgCProbe::describeStart()
@@ -846,7 +802,7 @@ void PkgCProbe::describeStart()
     PcpLine line;
     UInt32 regs[4];
     pcpCpuid(1, regs);
-    line.add("r5; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
+    line.add("r6; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
     if (pwrm == nullptr)
         line.add("; no PMC LTR registers found there or at 0x%08x: read-only, nothing will be changed", kPwrmDefault);
     else
@@ -866,8 +822,8 @@ void PkgCProbe::describeStart()
     } else {
         line.add("; not a Skylake/Kaby Lake CPU: MSRs not read");
     }
-    line.add("; StartDelay %u s, PhaseSeconds %u s, RunTest %s, ApplyMask 0x%x, SataAlpm %s",
-             startDelay, phaseSeconds, runTest ? "yes" : "no", applyMask, keepAlpm ? "yes" : "no");
+    line.add("; StartDelay %u s, PhaseSeconds %u s, RunTest %s, ApplyMask 0x%x, WifiL1 %s",
+             startDelay, phaseSeconds, runTest ? "yes" : "no", applyMask, keepWifiL1 ? "yes" : "no");
     addResult(line.c_str());
 }
 
@@ -1055,16 +1011,17 @@ void PkgCProbe::describeRootPort(IOPCIDevice *port, int devfn, UInt64 ecam)
     UInt32 secondary = (port->configRead32(0x18) >> 8) & 0xFF;
     line.add("PCIe %02x.%u %04x:%04x:", devfn >> 3, devfn & 7, id & 0xFFFF, id >> 16);
     UInt8 express = findCapability(port, 0x10);
+    UInt32 slot = 0;
     if (express != 0) {
-        UInt32 lcap = port->configRead32(static_cast<UInt8>(express + 0x0C));
-        UInt32 link = port->configRead32(static_cast<UInt8>(express + 0x10));
-        UInt32 slot = port->configRead32(static_cast<UInt8>(express + 0x18));
-        UInt32 dctl2 = port->configRead32(static_cast<UInt8>(express + 0x28));
+        UInt32 lcap = port->configRead32(static_cast<UInt8>(express + kExpLinkCap));
+        UInt32 link = port->configRead32(static_cast<UInt8>(express + kExpLinkCtl));
+        slot = port->configRead32(static_cast<UInt8>(express + kExpSlotCtl));
+        UInt32 dctl2 = port->configRead32(static_cast<UInt8>(express + kExpDevCtl2));
         line.add(" LNKCAP ASPM %s, LNKCTL 0x%04x (ASPM %s, CLKPM %u, link disable %u), LNKSTS 0x%04x (Gen%u x%u, "
-                 "DLL active %u), presence %u, LTR %s",
+                 "training %u, DLL active %u), presence %u, LTR %s",
                  aspmName((lcap >> 10) & 3), link & 0xFFFF, aspmName(link & 3), (link >> 8) & 1, (link >> 4) & 1,
-                 link >> 16, (link >> 16) & 0xF, (link >> 20) & 0x3F, (link >> 29) & 1, (slot >> 22) & 1,
-                 ((dctl2 >> 10) & 1) != 0 ? "on" : "off");
+                 link >> 16, (link >> 16) & 0xF, (link >> 20) & 0x3F, (link >> 27) & 1, (link >> 29) & 1,
+                 (slot >> 22) & 1, ((dctl2 >> 10) & 1) != 0 ? "on" : "off");
     }
     addL1ss(line, ecam, 0, static_cast<UInt32>(devfn), id);
 
@@ -1073,6 +1030,11 @@ void PkgCProbe::describeRootPort(IOPCIDevice *port, int devfn, UInt64 ecam)
     UInt32 deviceClass = 0;
     if (device == nullptr) {
         line.add(" | no device");
+        if (express != 0) {
+            UInt32 slotCap = port->configRead32(static_cast<UInt8>(express + kExpSlotCap));
+            line.add("; SLTCAP 0x%08x (hot plug capable %u, surprise %u, slot %u), SLTCTL 0x%04x, SLTSTA 0x%04x",
+                     slotCap, (slotCap >> 6) & 1, (slotCap >> 5) & 1, slotCap >> 19, slot & 0xFFFF, slot >> 16);
+        }
     } else {
         deviceId = device->configRead32(0x00);
         deviceClass = device->configRead32(kPciClassConfig) >> 8;
@@ -1270,255 +1232,355 @@ void PkgCProbe::describeIo()
     children->release();
 }
 
-// The AHCI driver's port object for ahciPort: SAT0 (IOPCIDevice) -> controller -> PRTn@n, retained.
-IOService *PkgCProbe::findAhciPortService()
+// r6: finds the Intel Wi-Fi card (vendor 8086, class 02.80) behind a PCH root port and decides
+// once whether its ASPM L1 enable may be switched. Prints what it found. Only reads.
+bool PkgCProbe::wifiPrepare()
 {
-    IOService *found = nullptr;
-    OSIterator *controllers = ahciDevice != nullptr ? ahciDevice->getChildIterator(gIOServicePlane) : nullptr;
-    if (controllers == nullptr)
-        return nullptr;
-    OSObject *a = nullptr;
-    while (found == nullptr && (a = controllers->getNextObject()) != nullptr) {
-        IORegistryEntry *controller = OSDynamicCast(IORegistryEntry, a);
-        OSIterator *ports = controller != nullptr ? controller->getChildIterator(gIOServicePlane) : nullptr;
-        if (ports == nullptr)
-            continue;
-        OSObject *b = nullptr;
-        while ((b = ports->getNextObject()) != nullptr) {
-            IOService *service = OSDynamicCast(IOService, b);
-            if (service != nullptr && decimalValue(service->getLocation()) == ahciPort) {
-                found = service;
-                found->retain();
-                break;
+    if (wifiChecked)
+        return wifiReady;
+    wifiChecked = true;
+    wifiReady = false;
+    wifiWhy[0] = '\0';
+
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children != nullptr) {
+        OSObject *child = nullptr;
+        while (wifiDevice == nullptr && (child = children->getNextObject()) != nullptr) {
+            IOPCIDevice *port = OSDynamicCast(IOPCIDevice, child);
+            if (port == nullptr)
+                continue;
+            int devfn = pciDevFn(port);
+            if (devfn < (0x1B << 3) || devfn >= (0x1E << 3) ||
+                (port->configRead32(kPciClassConfig) >> 8) != kBridgeClass)
+                continue;
+            IOPCIDevice *device = firstDeviceBehind(port);
+            if (device == nullptr)
+                continue;
+            UInt32 id = device->configRead32(0x00);
+            UInt32 deviceClass = device->configRead32(kPciClassConfig) >> 8;
+            if ((id & 0xFFFF) == kIntelVendor && (deviceClass >> 8) == kWifiClassPrefix) {
+                wifiDevice = device;                 // keeps the retain from firstDeviceBehind
+                wifiPort = port;
+                wifiPort->retain();
+                wifiPortDevFn = devfn;
+                wifiBus = (port->configRead32(0x18) >> 8) & 0xFF;
+            } else {
+                device->release();
             }
         }
-        ports->release();
+        children->release();
     }
-    controllers->release();
-    return found;
-}
-
-// Decides once whether ALPM may be switched through the AHCI driver.
-bool PkgCProbe::alpmPrepare()
-{
-    if (alpmChecked)
-        return alpmReady;
-    alpmChecked = true;
-    findAhci();
 
     const char *why = nullptr;
-    IOService *port = nullptr;
-    if (ahci == nullptr || ahciPort < 0 || ahciDevice == nullptr)
-        why = "no AHCI port with a device link";
+    if (wifiDevice == nullptr)
+        why = "no Intel Wi-Fi card (class 02.80) behind a chipset root port";
     if (why == nullptr) {
-        port = findAhciPortService();
-        if (port == nullptr)
-            why = "the AHCI driver's port object was not found";
+        wifiPortCap = findCapability(wifiPort, 0x10);
+        wifiCap = findCapability(wifiDevice, 0x10);
+        wifiPm = findCapability(wifiDevice, 0x01);
+        if (wifiPortCap == 0 || wifiCap == 0 || wifiPm == 0)
+            why = "PCI Express or power management capability not found";
+    }
+
+    PcpLine line;
+    if (wifiDevice == nullptr) {
+        line.add("Wi-Fi");
+    } else {
+        UInt32 id = wifiDevice->configRead32(0x00);
+        line.add("Wi-Fi %02x:00.0 %04x:%04x behind %02x.%u", wifiBus, id & 0xFFFF, id >> 16,
+                 wifiPortDevFn >> 3, wifiPortDevFn & 7);
     }
     if (why == nullptr) {
-        const OSMetaClass *meta = port->getMetaClass();
-        if (meta == nullptr || !sameText(meta->getClassName(), kAhciPortClass))
-            why = "the AHCI port driver is not CtlnaIntelPchSeriesAHCIPort";
-    }
-    if (why == nullptr) {
-        const void *const *vtable = *reinterpret_cast<const void *const *const *>(port);
-        const void *support = vtable[kSlotAlpmSupport];
-        const void *linkState = vtable[kSlotAlpmState];
-        const void *enable = vtable[kSlotAlpmEnable];
-        const void *disable = vtable[kSlotAlpmDisable];
-        if (!sameCode(support, kCodeAlpmSupport, sizeof(kCodeAlpmSupport)) ||
-            !sameCode(linkState, kCodeAlpmState, sizeof(kCodeAlpmState)) ||
-            !sameCode(enable, kCodeAlpmEnable, sizeof(kCodeAlpmEnable)) ||
-            !sameCode(disable, kCodeAlpmDisable, sizeof(kCodeAlpmDisable))) {
-            why = "the driver's ALPM code is not the CtlnaAHCIPort 341.0.2 code that was checked";
+        UInt32 cardLink = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpLinkCtl));
+        UInt32 cardLcap = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpLinkCap));
+        UInt32 cardDevCap = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpDevCap));
+        UInt32 cardDevCap2 = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpDevCap2));
+        UInt32 cardDevCtl2 = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpDevCtl2));
+        UInt32 pmcsr = wifiDevice->configRead32(static_cast<UInt8>(wifiPm + 4));
+        UInt32 portLink = wifiPort->configRead32(static_cast<UInt8>(wifiPortCap + kExpLinkCtl));
+        UInt32 portLcap = wifiPort->configRead32(static_cast<UInt8>(wifiPortCap + kExpLinkCap));
+        UInt32 portDevCtl2 = wifiPort->configRead32(static_cast<UInt8>(wifiPortCap + kExpDevCtl2));
+        wifiOriginal = static_cast<UInt16>(cardLink & 0xFFFF);
+        if (cardLink == 0xFFFFFFFF) {
+            why = "the card reads all ones";
         } else {
-            alpmSupport = reinterpret_cast<PortFunction>(const_cast<void *>(support));
-            alpmState = reinterpret_cast<PortFunction>(const_cast<void *>(linkState));
-            alpmEnable = reinterpret_cast<PortFunction>(const_cast<void *>(enable));
-            alpmDisable = reinterpret_cast<PortFunction>(const_cast<void *>(disable));
+            line.add(": D%u, card LNKCTL 0x%04x (ASPM %s, CLKPM %u), LNKCAP ASPM %s, L1 exit %s, accepts L1 latency %s, "
+                     "LTR %s (supported %u); root port LNKCTL 0x%04x (ASPM %s), L1 exit %s, LTR %s, link %s",
+                     pmcsr & 3, cardLink & 0xFFFF, aspmName(cardLink & 3), (cardLink >> 8) & 1,
+                     aspmName((cardLcap >> 10) & 3), l1ExitName((cardLcap >> 15) & 7),
+                     l1AcceptName((cardDevCap >> 9) & 7), ((cardDevCtl2 >> 10) & 1) != 0 ? "on" : "off",
+                     (cardDevCap2 >> 11) & 1, portLink & 0xFFFF, aspmName(portLink & 3),
+                     l1ExitName((portLcap >> 15) & 7), ((portDevCtl2 >> 10) & 1) != 0 ? "on" : "off",
+                     (portLink & kLinkDllActive) != 0 ? "up" : "down");
+            if (((cardLcap >> 10) & 2) == 0)
+                why = "the card does not support L1";
         }
     }
-    if (why == nullptr) {
-        volatile UInt32 *regs = portRegs();
-        UInt32 cap = ahci[0x00 / 4];
-        if (((cap >> 26) & 1) == 0 || ((cap >> 13) & 1) == 0 || ((cap >> 14) & 1) == 0)
-            why = "the controller does not support ALPM, Partial and Slumber";
-        else if ((regs[kPxSSTS / 4] & 0xF) != 3)
-            why = "no device link";
-        else if ((regs[kPxCMD / 4] & kCmdStart) == 0)
-            why = "the port is not running";
-        else if ((regs[kPxIE / 4] & kIePhyRdy) != 0)
-            why = "PhyRdy-change interrupts are on for this port (hot plug)";
-        else if (port->getWorkLoop() == nullptr)
-            why = "the AHCI driver has no work loop";
-        else if (alpmSupport(port) == 0)
-            why = "the AHCI driver reports no ALPM support for this port";
-    }
     if (why != nullptr) {
-        snprintf(alpmWhy, sizeof(alpmWhy), "%s", why);
-        alpmSupport = alpmState = alpmEnable = alpmDisable = nullptr;
-        if (port != nullptr)
-            port->release();
-        PcpLine line;
-        line.add("SATA ALPM: nothing will be changed (%s)", why);
+        snprintf(wifiWhy, sizeof(wifiWhy), "%s", why);
+        line.add("; L1 will not be changed (%s)", why);
         addResult(line.c_str());
         return false;
     }
-
-    alpmPort = port;                         // keeps the retain from findAhciPortService
-    alpmReady = true;
-    alpmWasOn = (portRegs()[kPxCMD / 4] & kCmdAlpe) != 0;
-    alpmOn = alpmWasOn;
-    PcpLine line;
-    line.add("SATA ALPM: ready; driver %s, port %d, its ALPM support %u, link state %u; ALPM was %s before",
-             kAhciPortClass, ahciPort, alpmSupport(port), alpmState(port), alpmWasOn ? "on" : "off");
+    wifiReady = true;
+    line.add("; ready (only the card's L1 enable is switched; the root port is not written)");
     addResult(line.c_str());
     return true;
 }
 
-// Runs one ALPM call on the AHCI driver's work loop, so it never overlaps the driver's own work.
-UInt32 PkgCProbe::alpmRun(UInt32 call)
+void PkgCProbe::wifiForget()
 {
-    UInt32 result = 0xFFFFFFFF;
-    if (!alpmReady || alpmPort == nullptr || alpmPort->isInactive())
-        return result;
-    IOWorkLoop *loop = alpmPort->getWorkLoop();
-    if (loop == nullptr)
-        return result;
-    loop->runAction(&PkgCProbe::alpmAction, this, reinterpret_cast<void *>(static_cast<uintptr_t>(call)), &result);
-    return result;
+    if (wifiDevice != nullptr) {
+        wifiDevice->release();
+        wifiDevice = nullptr;
+    }
+    if (wifiPort != nullptr) {
+        wifiPort->release();
+        wifiPort = nullptr;
+    }
+    wifiCap = wifiPortCap = wifiPm = 0;
+    wifiChecked = wifiReady = wifiOn = false;
 }
 
-IOReturn PkgCProbe::alpmAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3)
+// The card's Link Control, or 0xFFFF if it cannot be read.
+UInt16 PkgCProbe::wifiControl()
 {
-    (void)arg2; (void)arg3;
-    PkgCProbe *self = OSDynamicCast(PkgCProbe, owner);
-    UInt32 *result = static_cast<UInt32 *>(arg1);
-    if (self == nullptr || result == nullptr || self->alpmPort == nullptr || self->alpmEnable == nullptr)
-        return kIOReturnSuccess;
-    switch (static_cast<UInt32>(reinterpret_cast<uintptr_t>(arg0))) {
-    case kCallEnable:
-        *result = self->alpmEnable(self->alpmPort);
-        break;
-    case kCallDisable:
-        *result = self->alpmDisable(self->alpmPort);
-        self->wakeLinkGated();
-        break;
-    case kCallSlumber:
-        *result = self->slumberGated();
-        break;
-    default:
-        break;
-    }
-    return kIOReturnSuccess;
+    if (wifiDevice == nullptr || wifiCap == 0)
+        return 0xFFFF;
+    UInt32 link = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpLinkCtl));
+    return link == 0xFFFFFFFF ? 0xFFFF : static_cast<UInt16>(link & 0xFFFF);
 }
 
-// Asks for Slumber the way the driver's inactivity timer does: from Partial first back to
-// Active (1 ms), then PxCMD.ICC = Slumber, and up to 5 ms for the link to get there.
-// Only when no command is outstanding. Runs on the AHCI driver's work loop.
-UInt32 PkgCProbe::slumberGated()
+// on: set the card's ASPM L1 enable, only while the card is in D0, its link is up and the root
+// port has L1 enabled. off: put the card's ASPM field (bits 1:0) back to its value before the
+// test. Only the card's Link Control is written (16 bits). Returns nullptr when done, else why not.
+const char *PkgCProbe::wifiSet(bool on)
 {
-    volatile UInt32 *regs = portRegs();
-    if (regs[kPxCI / 4] != 0 || regs[kPxSACT / 4] != 0 || (regs[kPxCMD / 4] & kCmdStart) == 0)
-        return kSlumberBusy;
-    UInt32 ipm = (regs[kPxSSTS / 4] >> 8) & 0xF;
-    if (ipm == 6)
-        return kSlumberAlready;
-    if (ipm == 2) {
-        regs[kPxCMD / 4] = (regs[kPxCMD / 4] & ~kCmdIccMask) | kCmdIccActive;
-        IOSleep(1);
-        ipm = (regs[kPxSSTS / 4] >> 8) & 0xF;
+    if (!wifiReady || wifiDevice == nullptr || wifiPort == nullptr)
+        return "no card";
+    if (wifiDevice->isInactive() || wifiPort->isInactive())
+        return "the card's PCI object is going away";
+    UInt32 cardLink = wifiDevice->configRead32(static_cast<UInt8>(wifiCap + kExpLinkCtl));
+    if (cardLink == 0xFFFFFFFF)
+        return "the card reads all ones";
+    UInt16 control = static_cast<UInt16>(cardLink & 0xFFFF);
+    const UInt16 aspmBits = kLinkAspmL0s | kLinkAspmL1;
+    if (!on) {
+        UInt16 value = static_cast<UInt16>((control & ~aspmBits) | (wifiOriginal & aspmBits));
+        if (value != control)
+            wifiDevice->configWrite16(static_cast<UInt8>(wifiCap + kExpLinkCtl), value);
+        wifiOn = false;
+        return nullptr;
     }
-    if (ipm != 1)
-        return kSlumberNotActive;
-    regs[kPxCMD / 4] = (regs[kPxCMD / 4] & ~kCmdIccMask) | kCmdIccSlumber;
-    for (unsigned k = 0; k < 5; k++) {
-        if (((regs[kPxSSTS / 4] >> 8) & 0xF) == 6)
-            return kSlumberReached;
-        IOSleep(1);
-    }
-    return ((regs[kPxSSTS / 4] >> 8) & 0xF) == 6 ? kSlumberReached : kSlumberTimeout;
+    if ((wifiDevice->configRead32(static_cast<UInt8>(wifiPm + 4)) & 3) != 0)
+        return "the card is not in D0";
+    UInt32 portLink = wifiPort->configRead32(static_cast<UInt8>(wifiPortCap + kExpLinkCtl));
+    if ((portLink & kLinkDllActive) == 0)
+        return "the link is down";
+    if ((portLink & kLinkAspmL1) == 0)
+        return "L1 is not enabled on the root port";
+    if ((control & kLinkAspmL1) == 0)
+        wifiDevice->configWrite16(static_cast<UInt8>(wifiCap + kExpLinkCtl), static_cast<UInt16>(control | kLinkAspmL1));
+    wifiOn = true;
+    return nullptr;
 }
 
-// After ALPM is off: wake the link if it is idle in Partial or Slumber (up to 10 ms), and clear the
-// PhyRdy-change and Comm-Wake bits that the link changes left in PxSERR (write 1 to clear; nothing else).
-// Runs on the AHCI driver's work loop.
-void PkgCProbe::wakeLinkGated()
+// WifiL1: set the card's L1 enable again when it is off (AirportItlwm clears it whenever it
+// starts the card). Does nothing while the card is not in D0 (for example Wi-Fi switched off).
+void PkgCProbe::wifiKeep(const char *when)
 {
-    volatile UInt32 *regs = portRegs();
-    UInt32 ipm = (regs[kPxSSTS / 4] >> 8) & 0xF;
-    if ((ipm == 2 || ipm == 6) && regs[kPxCI / 4] == 0 && regs[kPxSACT / 4] == 0 && (regs[kPxCMD / 4] & kCmdStart) != 0) {
-        regs[kPxCMD / 4] = (regs[kPxCMD / 4] & ~kCmdIccMask) | kCmdIccActive;
-        for (unsigned k = 0; k < 10 && ((regs[kPxSSTS / 4] >> 8) & 0xF) != 1; k++)
-            IOSleep(1);
-    }
-    UInt32 diag = regs[kPxSERR / 4] & kSerrPhyRdyWake;
-    if (diag != 0)
-        regs[kPxSERR / 4] = diag;
-}
-
-// What a test phase does to SATA ALPM. The note goes into the phase's result line.
-void PkgCProbe::sataApply(UInt32 action)
-{
-    alpmNote[0] = '\0';
-    if (!alpmReady) {
-        if (action != kSataAsFound)
-            snprintf(alpmNote, sizeof(alpmNote), "SATA ALPM not used: %s", alpmWhy[0] != '\0' ? alpmWhy : "not prepared");
+    if (!keepWifiL1 || !awake)
         return;
-    }
-    bool want = action == kSataAsFound ? alpmWasOn : (action & kSataAlpm) != 0;
-    UInt32 status = 0;
-    if (want != alpmOn) {
-        status = alpmRun(want ? kCallEnable : kCallDisable);
-        alpmOn = want;
-    }
-    UInt32 slumber = 0xFFFFFFFF;
-    bool asked = (action & kSataSlumber) != 0;
-    if (asked)
-        slumber = alpmRun(kCallSlumber);
-    UInt32 command = portRegs()[kPxCMD / 4];
-    snprintf(alpmNote, sizeof(alpmNote), "ALPM %s (PxCMD 0x%08x, ALPE %u%s)%s%s", want ? "on" : "off",
-             command, (command >> 26) & 1, status != 0 ? ", driver call FAILED" : "",
-             asked ? ", Slumber " : "", asked ? slumberName(slumber) : "");
-}
-
-// Back to how the driver had ALPM before the test.
-void PkgCProbe::alpmRestore()
-{
-    if (!alpmReady || alpmOn == alpmWasOn)
+    if (wifiDevice != nullptr && (wifiDevice->isInactive() || wifiPort->isInactive()))
+        wifiForget();
+    if (!wifiPrepare())
         return;
-    alpmRun(alpmWasOn ? kCallEnable : kCallDisable);
-    alpmOn = alpmWasOn;
-}
-
-// SataAlpm: ALPM on through the driver; Partial by the controller, Slumber by the driver's own timer.
-void PkgCProbe::alpmKeep()
-{
-    alpmPending = false;
-    if (!keepAlpm || !awake || !alpmPrepare())
+    UInt16 before = wifiControl();
+    if (before == 0xFFFF || (before & kLinkAspmL1) != 0)
         return;
-    UInt32 status = alpmRun(kCallEnable);
-    alpmOn = true;
-    alpmKeepCount++;
-    setProperty("SataAlpmCount", alpmKeepCount, 32);
-    UInt32 command = portRegs()[kPxCMD / 4];
-    bool on = (command & kCmdAlpe) != 0;
-    if (alpmKeepCount <= kMaxApplyLogs || !on) {
+    if (wifiSet(true) != nullptr)
+        return;
+    wifiKeepCount++;
+    setProperty("WifiL1Count", wifiKeepCount, 32);
+    if (wifiKeepCount <= kMaxApplyLogs) {
         PcpLine line;
-        line.add("SataAlpm %s: driver call 0x%x, PxCMD 0x%08x (ALPE %u), link %s", alpmWhen, status, command,
-                 on ? 1 : 0, linkStateName((portRegs()[kPxSSTS / 4] >> 8) & 0xF));
+        line.add("WifiL1 %s: card LNKCTL 0x%04x -> 0x%04x", when, before, wifiControl());
         addResult(line.c_str());
     }
-    // Right after a wake the driver may still be setting the port up: check once more later.
-    if (!on && alpmRetries < 3 && timer != nullptr) {
-        alpmRetries++;
-        alpmPending = true;
-        alpmWaitMS = 0;
-        alpmWhen = "retry";
-        timer->setTimeoutMS(kAlpmRetryMS);
-    } else if (on) {
-        alpmRetries = 0;
+}
+
+// r6: PCH root ports with no device below them and no link (DLL Link Active 0, not disabled).
+void PkgCProbe::idlePrepare()
+{
+    if (idleChecked)
+        return;
+    idleChecked = true;
+    PcpLine line;
+    line.add("Idle root ports (no device, no link):");
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children != nullptr) {
+        OSObject *child = nullptr;
+        while (idleCount < kMaxIdlePorts && (child = children->getNextObject()) != nullptr) {
+            IOPCIDevice *port = OSDynamicCast(IOPCIDevice, child);
+            if (port == nullptr)
+                continue;
+            int devfn = pciDevFn(port);
+            if (devfn < (0x1B << 3) || devfn >= (0x1E << 3) ||
+                (port->configRead32(kPciClassConfig) >> 8) != kBridgeClass)
+                continue;
+            UInt8 cap = findCapability(port, 0x10);
+            if (cap == 0)
+                continue;
+            UInt32 link = port->configRead32(static_cast<UInt8>(cap + kExpLinkCtl));
+            if (link == 0xFFFFFFFF || (link & kLinkDllActive) != 0 || (link & kLinkDisable) != 0)
+                continue;
+            IOPCIDevice *below = firstDeviceBehind(port);
+            if (below != nullptr) {
+                below->release();
+                continue;
+            }
+            port->retain();
+            idlePorts[idleCount].port = port;
+            idlePorts[idleCount].cap = cap;
+            idlePorts[idleCount].devfn = devfn;
+            idlePorts[idleCount].original = static_cast<UInt16>(link & 0xFFFF);
+            idleCount++;
+            line.add(" %02x.%u (LNKCTL 0x%04x)", devfn >> 3, devfn & 7, link & 0xFFFF);
+        }
+        children->release();
     }
+    if (idleCount == 0)
+        line.add(" none");
+    addResult(line.c_str());
+}
+
+// off: Link Disable on these idle root ports (skipped if a link has come up meanwhile);
+// otherwise put their Link Disable bit back as it was before the test. 16-bit writes.
+void PkgCProbe::idleSet(bool off)
+{
+    for (unsigned i = 0; i < idleCount; i++) {
+        IdlePort &entry = idlePorts[i];
+        if (entry.port == nullptr || entry.port->isInactive())
+            continue;
+        UInt32 link = entry.port->configRead32(static_cast<UInt8>(entry.cap + kExpLinkCtl));
+        if (link == 0xFFFFFFFF)
+            continue;
+        UInt16 control = static_cast<UInt16>(link & 0xFFFF);
+        UInt16 value;
+        if (off) {
+            if ((link & kLinkDllActive) != 0)
+                continue;
+            value = static_cast<UInt16>(control | kLinkDisable);
+        } else {
+            value = static_cast<UInt16>((control & ~kLinkDisable) | (entry.original & kLinkDisable));
+        }
+        if (value != control)
+            entry.port->configWrite16(static_cast<UInt8>(entry.cap + kExpLinkCtl), value);
+    }
+    idleOff = off;
+}
+
+void PkgCProbe::idleRelease()
+{
+    for (unsigned i = 0; i < idleCount; i++) {
+        if (idlePorts[i].port != nullptr) {
+            idlePorts[i].port->release();
+            idlePorts[i].port = nullptr;
+        }
+    }
+    idleCount = 0;
+    idleChecked = false;
+    idleOff = false;
+}
+
+// r6: maps the chipset xHCI (00:14.0) registers to count its port states during the phases. Read only.
+void PkgCProbe::xhciPrepare()
+{
+    if (xhciMap != nullptr)
+        return;
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children == nullptr)
+        return;
+    OSObject *child = nullptr;
+    while (xhciMap == nullptr && (child = children->getNextObject()) != nullptr) {
+        IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
+        if (device != nullptr && pciDevFn(device) == kPchXhciDevFn &&
+            (device->configRead32(kPciClassConfig) >> 8) == kXhciClass)
+            xhciMap = device->mapDeviceMemoryWithRegister(kBar0Config, kIOMapInhibitCache);
+    }
+    children->release();
+    if (xhciMap == nullptr)
+        return;
+    xhciRegs = reinterpret_cast<volatile UInt32 *>(xhciMap->getVirtualAddress());
+    xhciSize = xhciMap->getSize();
+    UInt32 cap0 = xhciSize >= 8 ? xhciRegs[0] : 0xFFFFFFFF;
+    if (cap0 == 0xFFFFFFFF) {
+        xhciRelease();
+        return;
+    }
+    xhciCapLength = cap0 & 0xFF;
+    xhciPorts = (xhciRegs[1] >> 24) & 0xFF;
+    if (xhciPorts > kMaxUsbPorts)
+        xhciPorts = kMaxUsbPorts;
+}
+
+void PkgCProbe::xhciRelease()
+{
+    if (xhciMap != nullptr) {
+        xhciMap->release();
+        xhciMap = nullptr;
+    }
+    xhciRegs = nullptr;
+    xhciSize = 0;
+    xhciPorts = 0;
+}
+
+// What a phase does besides the ignore register. The note goes into the phase's result line.
+void PkgCProbe::applyActions(UInt32 actions)
+{
+    phaseNote.clear();
+    bool wantWifi = (actions & kWifiL1) != 0;
+    if (wifiReady) {
+        const char *why = nullptr;
+        if (wantWifi)
+            why = wifiSet(true);
+        else if (wifiOn)
+            why = wifiSet(false);
+        UInt16 control = wifiControl();
+        phaseNote.add("Wi-Fi card LNKCTL 0x%04x (ASPM %s)", control, aspmName(control & 3));
+        if (why != nullptr)
+            phaseNote.add(", not changed: %s", why);
+    } else if (wantWifi) {
+        phaseNote.add("Wi-Fi L1 not used: %s", wifiWhy[0] != '\0' ? wifiWhy : "not prepared");
+    }
+
+    bool wantOff = (actions & kIdlePortsOff) != 0;
+    if (idleCount > 0) {
+        if (wantOff != idleOff)
+            idleSet(wantOff);
+        phaseNote.add("%sidle root ports:", phaseNote.empty() ? "" : "; ");
+        for (unsigned i = 0; i < idleCount; i++) {
+            if (idlePorts[i].port == nullptr)
+                continue;
+            UInt32 link = idlePorts[i].port->configRead32(static_cast<UInt8>(idlePorts[i].cap + kExpLinkCtl));
+            phaseNote.add(" %02x.%u %s", idlePorts[i].devfn >> 3, idlePorts[i].devfn & 7,
+                          link == 0xFFFFFFFF ? "unreadable" : ((link & kLinkDisable) != 0 ? "link disabled" : "as found"));
+        }
+    } else if (wantOff) {
+        phaseNote.add("%sno idle root port to switch off", phaseNote.empty() ? "" : "; ");
+    }
+}
+
+// Puts back what the phases changed: the card's ASPM field and Link Disable on idle root ports.
+void PkgCProbe::restoreActions()
+{
+    if (wifiOn)
+        wifiSet(false);
+    if (idleOff)
+        idleSet(false);
 }
 
 void PkgCProbe::writeIgnore(UInt32 value)
@@ -1571,6 +1633,8 @@ void PkgCProbe::resetSamples()
         linkCount[i] = 0;
     for (unsigned i = 0; i < kGatedCount; i++)
         gatedCount[i] = 0;
+    for (unsigned i = 0; i < kMaxUsbPorts; i++)
+        usbSeen[i] = usbU0[i] = usbU2[i] = usbU3[i] = 0;
     limitMin = 0xFF;
     limitMax = 0;
     samples = 0;
@@ -1620,6 +1684,25 @@ void PkgCProbe::sample(UInt32 ignored)
         default: linkCount[4]++; break;
         }
     }
+    if (xhciRegs != nullptr) {
+        for (UInt32 n = 0; n < xhciPorts; n++) {
+            UInt64 offset = xhciCapLength + 0x400 + 0x10 * n;
+            if (offset + 4 > xhciSize)
+                break;
+            UInt32 portsc = xhciRegs[offset / 4];
+            if (portsc == 0xFFFFFFFF)
+                break;
+            if ((portsc & 1) == 0)
+                continue;
+            usbSeen[n]++;
+            switch ((portsc >> 5) & 0xF) {
+            case 0: usbU0[n]++; break;
+            case 2: usbU2[n]++; break;
+            case 3: usbU3[n]++; break;
+            default: break;
+            }
+        }
+    }
     if (msrUsable) {
         UInt32 limit = static_cast<UInt32>(pcpReadMsr(kMsrPkgCstConfig) & 0xF);
         if (limit < limitMin)
@@ -1636,24 +1719,6 @@ void PkgCProbe::addRange(PcpLine &line, UInt64 low, UInt64 high)
         line.add(" to ");
         line.addTime(high);
     }
-}
-
-void PkgCProbe::addBusDelay(PcpLine &line)
-{
-    IOPlatformExpert *platform = IOService::getPlatform();
-    OSObject *object = platform != nullptr ? platform->copyProperty("IOPlatformMaxBusDelay") : nullptr;
-    OSNumber *number = OSDynamicCast(OSNumber, object);
-    OSArray *array = OSDynamicCast(OSArray, object);
-    if (number == nullptr && array != nullptr)
-        number = OSDynamicCast(OSNumber, array->getObject(0));
-    if (number == nullptr)
-        line.add("unknown");
-    else if (number->unsigned64BitValue() == kNone)
-        line.add("no limit");
-    else
-        line.add("%llu ns", number->unsigned64BitValue());
-    if (object != nullptr)
-        object->release();
 }
 
 void PkgCProbe::report(const PcpSnapshot &last)
@@ -1699,18 +1764,32 @@ void PkgCProbe::report(const PcpSnapshot &last)
             line.add(" %s %u", kPfearNames[kGatedShown[k]], gatedCount[k]);
     }
     if (ahci != nullptr && ahciPort >= 0)
-        line.add(" | SATA link active %u, partial %u, slumber %u, devsleep %u, other %u; ALPE at the end %u",
-                 linkCount[0], linkCount[1], linkCount[2], linkCount[3], linkCount[4],
-                 (portRegs()[kPxCMD / 4] >> 26) & 1);
+        line.add(" | SATA link active %u, partial %u, slumber %u, other %u",
+                 linkCount[0], linkCount[1], linkCount[2], linkCount[3] + linkCount[4]);
+    if (xhciRegs != nullptr && samples > 0) {
+        line.add(" | USB U0/U2/U3 of %u:", samples);
+        bool any = false;
+        for (UInt32 n = 0; n < xhciPorts; n++) {
+            if (usbSeen[n] == 0)
+                continue;
+            any = true;
+            line.add(" p%u %u/%u/%u", n + 1, usbU0[n], usbU2[n], usbU3[n]);
+        }
+        if (!any)
+            line.add(" no device");
+    }
     if (msrUsable && samples > 0) {
         line.add(" | limit %s", limitName(limitMin));
         if (limitMax != limitMin)
             line.add(" to %s", limitName(limitMax));
     }
-    line.add(" | bus delay ");
-    addBusDelay(line);
-    if (alpmNote[0] != '\0')
-        line.add(" | %s", alpmNote);
+    if (!phaseNote.empty())
+        line.add(" | %s", phaseNote.c_str());
+    if (wifiOn) {
+        UInt16 control = wifiControl();
+        if (control != 0xFFFF && (control & kLinkAspmL1) == 0)
+            line.add(" | Wi-Fi L1 was cleared during the phase (card LNKCTL 0x%04x)", control);
+    }
     addResult(line.c_str());
 }
 
@@ -1719,9 +1798,9 @@ void PkgCProbe::beginTest()
     findAhci();
     describeLtr("LTR before the test:");
     describeIo();
-    alpmPrepare();
-    alpmWasOn = alpmReady && (portRegs()[kPxCMD / 4] & kCmdAlpe) != 0;
-    alpmOn = alpmWasOn;
+    wifiPrepare();
+    idlePrepare();
+    xhciPrepare();
     state = kRunning;
     phase = 0;
     tick = 0;
@@ -1737,7 +1816,7 @@ void PkgCProbe::stepTest()
 
     if (tick == 0) {
         writeIgnore(ignored);
-        sataApply(kPhases[phase].sata);
+        applyActions(kPhases[phase].actions);
     } else if (tick == kSettleTicks) {
         takeSnapshot(&first);
         resetSamples();
@@ -1765,27 +1844,37 @@ void PkgCProbe::finishTest(const char *why)
 {
     if (timer != nullptr)
         timer->cancelTimeout();
-    alpmRestore();
+    restoreActions();
     if (ignoreChanged)
         writeIgnore(ignoreOriginal);
     state = kDone;
     PcpLine line;
     line.add("%s; LTR_IGN is 0x%08x", why, pwrm != nullptr ? readPwrm(kLtrIgnore) : 0);
-    if (ahci != nullptr && ahciPort >= 0) {
-        volatile UInt32 *regs = portRegs();
-        UInt32 command = regs[kPxCMD / 4];
-        line.add("; AHCI port %d: PxCMD 0x%08x (ALPE %u), link %s, PxSERR 0x%08x", ahciPort, command,
-                 (command >> 26) & 1, linkStateName((regs[kPxSSTS / 4] >> 8) & 0xF), regs[kPxSERR / 4]);
+    if (wifiReady) {
+        UInt16 control = wifiControl();
+        line.add("; Wi-Fi card LNKCTL 0x%04x (ASPM %s; before the test 0x%04x)", control, aspmName(control & 3),
+                 wifiOriginal);
     }
+    for (unsigned i = 0; i < idleCount; i++) {
+        if (idlePorts[i].port == nullptr)
+            continue;
+        UInt32 link = idlePorts[i].port->configRead32(static_cast<UInt8>(idlePorts[i].cap + kExpLinkCtl));
+        line.add("; root port %02x.%u LNKCTL 0x%04x (before the test 0x%04x)", idlePorts[i].devfn >> 3,
+                 idlePorts[i].devfn & 7, link & 0xFFFF, idlePorts[i].original);
+    }
+    if (ahci != nullptr && ahciPort >= 0)
+        line.add("; SATA link %s", linkStateName((portRegs()[kPxSSTS / 4] >> 8) & 0xF));
     addResult(line.c_str());
+    xhciRelease();
     if (awake)
         describePpfear("after the test");
     setProperty("State", why);
     if (applyMask != 0 && awake)
         applyFix("after the test");
-    if (keepAlpm && awake) {
-        alpmWhen = "after the test";
-        alpmKeep();
+    if (keepWifiL1 && awake) {
+        wifiKeep("after the test");
+        if (timer != nullptr)
+            timer->setTimeoutMS(kKeepCheckMS);
     }
 }
 
@@ -1820,14 +1909,10 @@ void PkgCProbe::onTimer()
     default:
         if (applyPending)
             applyFix("after wake");
-        if (alpmPending) {
-            if (alpmWaitMS != 0) {
-                UInt32 wait = alpmWaitMS;
-                alpmWaitMS = 0;
-                timer->setTimeoutMS(wait);
-            } else {
-                alpmKeep();
-            }
+        if (keepWifiL1) {
+            wifiKeep(keepWhen);
+            keepWhen = "check";
+            timer->setTimeoutMS(kKeepCheckMS);
         }
         break;
     }
@@ -1852,11 +1937,10 @@ IOReturn PkgCProbe::setAwakeAction(OSObject *owner, void *arg0, void *arg1, void
     if (arg0 == nullptr) {
         self->awake = false;
         self->applyPending = false;
-        self->alpmPending = false;
         self->timer->cancelTimeout();
         if (self->state == kRunning) {
-            // finishTest puts ALPM and the ignore register back before the Mac sleeps; with awake
-            // false it does not apply ApplyMask or SataAlpm (that happens after the wake).
+            // finishTest puts the Wi-Fi card, the idle root ports and the ignore register back
+            // before the Mac sleeps; with awake false it does not apply ApplyMask or WifiL1.
             self->finishTest("stopped: the Mac went to sleep during the test");
         } else if (self->state == kWaiting) {
             self->state = kDone;
@@ -1867,13 +1951,10 @@ IOReturn PkgCProbe::setAwakeAction(OSObject *owner, void *arg0, void *arg1, void
         self->awake = true;
         if (self->state == kDone && self->applyMask != 0 && self->writable)
             self->applyPending = true;
-        if (self->state == kDone && self->keepAlpm) {
-            self->alpmPending = true;
-            self->alpmWaitMS = kWakeAlpmMS - kWakeApplyMS;
-            self->alpmRetries = 0;
-            self->alpmWhen = "after wake";
-        }
-        if (self->applyPending || self->alpmPending)
+        bool keep = self->state == kDone && self->keepWifiL1;
+        if (keep)
+            self->keepWhen = "after wake";
+        if (self->applyPending || keep)
             self->timer->setTimeoutMS(kWakeApplyMS);
     }
     return kIOReturnSuccess;
