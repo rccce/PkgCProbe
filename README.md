@@ -2,73 +2,87 @@
 
 ## 目前的结论
 
-- SATA 控制器一直上报 10.2 µs 的延迟要求（LTR），把封装限制在 PC2。让芯片组不计 SATA 的 LTR（ApplyMask 4）后，封装能进 PC3。插电和电池下结果相同，唤醒后会自动重设（r3 已验证）。
-- 即使不计所有芯片组 LTR、屏幕也关着，PC6、PC7 仍是 0。CPU 每次想往 PC6 走，都因为 CPU 侧的 I/O 总线（IOSF）没能停下而退回 PC3。
-- r3 读到：独显口 PEG0 已经做完断电前的 L2/L3 握手（0x248 = 0x4000，0xC74 = 0x165，和 MacBook Pro 上停好的状态相同），但没有做通道断电，口本身还在 D0；DMI 链路的 CPU 这一侧开着 ASPM L1。
-- 固件的 PegSsdt 里，Windows 10 走的是“只握手”这条路（你的 OpenCore 让 macOS 也走这条路），其他系统走“关链路 + 通道断电 + 束断电”；Windows 下系统通常还会把 PEG0 放进 D3（推断）。r4 用来逐项试这些差别，并读出 DMI 芯片组那一侧的 ASPM 设置。
+- SATA 控制器一直上报 10.2 µs 的延迟要求（LTR），把封装限制在 PC2。ApplyMask 4（不计 SATA 的 LTR）后能进 PC3，插电、电池、唤醒后都已验证。
+- PC6 以上一直是 0。每次往深处走，都因为 I/O 总线（IOSF）没能停下而退回 PC3。
+- 已排除（r4，pkgc4 和 pkgc5）：DMI 链路两端的 ASPM L1、独显口 PEG0（D3hot、通道断电、束断电都试过）、RTL8111 链路的 ASPM L1（`pci-aspm-default = 2`）。芯片组所有 LTR 都不计时，也没有 PC6。
+- 新线索：所有测试里 SATA 链路每次采样都是 active，PxCMD.ALPE 是 0（链路省电从没开过）。Intel 从 Haswell 起，SATA 链路保持全功率就会让芯片组一直“在忙”，封装进不了更深的状态（见下方出处）。
+- 你 EFI 里的 AHCI 驱动 CtlnaAHCIPort 341.0.2 带有 Apple 自己的 ALPM 代码：开启后，控制器在链路空闲时自动进 Partial；驱动在 80 ms 没有读写后再把链路转到 Slumber。但本机上从没有被开启（推断：开启它的是 IOAHCIBlockStorage，条件在本机不满足）。r5 用来验证这条线索。
+
+出处：Linux 内核补丁 “libata: Add new med_power_with_dipm link_power_management_policy setting”（Hans de Goede，2017）；Matthew Garrett，“Reducing power consumption on Haswell and Broadwell systems”（2015）。
 
 ## 它做什么
 
-开机约 3 分钟后开始，分 7 段测量，每段先等 2 秒再测 15 秒，一共约 2 分钟：
+驱动启动 StartDelay 秒后开始（本目录的 Info.plist 是 300 秒，即 5 分钟）。
 
-| 段 | 内容 |
-|---|---|
-| P0 | 不改动，测基线 |
-| P1 | 让芯片组暂时不计 SATA 的 LTR |
-| P2 | 所有芯片组设备的 LTR 都不计 |
-| P3 | 同 P2，另把 PEG0 放进 D3hot |
-| P4 | 同 P2，另关 PEG0 的通道电源（0xC20 位 5:4 = 3，0xC38 位 3 = 1） |
-| P5 | 同 P2，另 D3hot + 关通道电源 + 关 8 个束（0x91C 到 0x9FC 的位 31） |
-| P6 | 全部写回原值，再测一次基线 |
+先只读一遍，每项一行：
 
-每段记录封装 PC2、PC3、PC6、PC7、PC8、PC9、PC10 的驻留比例、CPU 忙碌比例、封装和内存功耗、各设备的 LTR、SATA 链路状态、封装 C-state 上限和 macOS 的总线延迟限制。P3 到 P5 还记录 PEG0 改成了什么、是否已写回。
+- 芯片组各模块的断电状态（PPFEAR）：哪些开着，哪些已断电。
+- 每个芯片组 PCIe 根端口和后面的设备：ASPM、时钟电源管理、LTR 开关、L1 子状态。
+- 每个 xHCI 控制器：哪些 USB 口接了设备、速度、链路状态（U0 = 工作中，U2、U3 = 休眠）。
+- HD Audio：有没有正在运行的音频数据流。
+- RTL8111 芯片自己的 ASPM 开关（Config5 位 0）、时钟请求开关（Config2 位 7），以及网线是否连着。
+- AHCI 端口的更多寄存器（PxIE、PxIS、PxSERR、PxCI、PxSACT）。
 
-只读的部分，在开机时、测完后、前三次唤醒后各读一次：
+然后分 6 段测量，每段先等 2 秒再测 15 秒，一共约 1 分 45 秒：
 
-- 主桥 00:00.0：哪些 CPU 侧设备开着（DEVEN），DMI 链路 CPU 这一侧的 ASPM 设置和状态。
-- r4 新加：DMI 链路芯片组那一侧的 ASPM 设置和状态，经芯片组的边带寄存器窗口（0xFD000000，端口 0xEF）读取。同一窗口里的 TCO 基址要和 SMBus 控制器报的一致，结果才可信，结果行里会写 match 或 NO MATCH。
-- PEG0（00:01.0）：命令、总线号、电源状态、链路和插槽寄存器，以及扩展寄存器 0x248、0xC20、0xC38、0x91C 到 0x9FC、0xC74。
+| 段 | LTR 忽略 | SATA ALPM |
+|---|---|---|
+| P0 | 不计 SATA（日常设置） | 原样（关） |
+| P1 | 不计 SATA | 开（链路空闲时由控制器转入 Partial） |
+| P2 | 不计 SATA | 开，并请求一次 Slumber |
+| P3 | 全部计入 | 开 + Slumber（看开 ALPM 后还要不要 ApplyMask） |
+| P4 | 全部不计 | 开 + Slumber |
+| P5 | 不计 SATA | 恢复原样（关） |
+
+每段记录的内容和 r4 相同，另加：几个芯片组模块（OPI-DMI、XHCI、SPA、SPB、SPC、SATA、HDA）在采样中处于断电状态的次数，SATA ALPM 的状态和 Slumber 请求的结果。
 
 ## 它改什么
 
-- 芯片组电源管理控制器（PMC）里的 LTR 忽略寄存器：测试的约 2 分钟里按上表改，测完写回原值。ApplyMask 不为 0 时，测完后保持这些位，每次唤醒 1 秒后再设一次。本目录的 Info.plist 里 ApplyMask 是 4（只不计 SATA）。
-- r4 新加：P3 到 P5 时临时改 PEG0 的电源状态、通道和束的电源位，每段测完立刻写回原值并核对。测试中途睡眠或驱动停止时也会先写回。只有满足全部条件才会写：PEG0 是 8086:1901，后面没有任何设备，链路是断开的，L2/L3 握手已完成，PMC 寄存器也正常。任一条不满足就只测不写，结果里写明原因。
-- 不改 macOS 设置、NVRAM、BIOS 和任何文件。重启后这些寄存器都由 BIOS 重新设置。
+- LTR 忽略寄存器：同 r4。测完写回；ApplyMask 4 测完后保持，唤醒后 1 秒重设。
+- SATA ALPM（r5 新加）：P1 到 P4 约 70 秒里开着，P5 起恢复原样。开和关都是调用 AHCI 驱动自己的 Enable/Disable 函数，并在驱动自己的工作队列里执行，不会和驱动的读写同时进行。Slumber 按驱动计时器的同样方法请求（PxCMD.ICC），只在没有未完成的读写命令时请求。关掉后会唤醒链路，并清掉链路切换留在 PxSERR 里的两个状态位（PhyRdy 变化、Comm Wake），其他位不动。测试中途睡眠或驱动停止时，也会先恢复。
+- 下面几条全部满足才会开 ALPM，任何一条不满足就只测不改，结果里写明原因：
+  - 驱动对象是 CtlnaIntelPchSeriesAHCIPort；
+  - 驱动的 4 个 ALPM 函数和分析过的 341.0.2 逐字节相同；
+  - 控制器支持 ALPM、Partial 和 Slumber；
+  - 端口在运行、接着盘；
+  - 端口没有开 PhyRdy 变化中断（不是热插拔口）。这种端口上，驱动对链路切换不做处理，不会当成拔盘。
+- 不改 macOS 设置、NVRAM、BIOS 和任何文件。重启后一切由 BIOS 和驱动重新设置。
 
 风险（推断）：
 
-- 不计 SATA 的 LTR 后，这块 SATA 盘在空闲后第一次读写可能多等几十微秒，数据不会出错。
-- P2 到 P5 不计所有 LTR，如果 P3 到 P5 里封装真的进了更深的 C-state，这几十秒内 USB 音频之类可能偶尔卡一下。
-- PEG0 的这些位只影响已经断电的独显口。万一写回不完整，最坏是下一次睡眠前独显上电时链路起不来，macOS 本来就不用独显，重启即恢复。
+- ALPM 开着时，SATA 盘空闲后的第一次读写最多多等约 10 ms（从 Slumber 唤醒）。
+- 个别 SSD 的固件处理链路省电有缺陷。Linux 上 min_power 策略有过死机，甚至数据损坏的报告；Windows 和 Apple 用的“控制器进 Partial、软件再请求 Slumber”一般认为是安全的。测试只有约 70 秒，而且在空闲时。最坏情况是这块盘读写出错或被弹出，重启后恢复原样（平时 ALPM 是关的）。测试时请不要往 Dev 盘写东西；重要数据平时也应有备份。
 
-r3 已在你的机器上编译并运行过；r4 新加的部分只做过语法检查，还没有在 macOS 上编译和运行。
+r5 只做过语法检查，还没有在 macOS 上编译和运行。
 
 ## 编译（GitHub Actions）
 
-仓库里要有这三个文件：
+仓库里换两个文件，workflow 不变：
 
 | 仓库里的路径 | 内容 |
 |---|---|
-| `PkgCProbe/PkgCProbe.cpp` | 本目录的 `PkgCProbe.cpp`（r4 只改了这个文件） |
-| `PkgCProbe/Info.plist` | 本目录的 `Info.plist`（和 r3 相同，不用换） |
+| `PkgCProbe/PkgCProbe.cpp` | 本目录的 `PkgCProbe.cpp`（r5） |
+| `PkgCProbe/Info.plist` | 本目录的 `Info.plist`（r5：新增 SataAlpm = false，StartDelay 改为 300） |
 | `.github/workflows/pkgcprobe.yml` | 本目录的 `pkgcprobe.yml`（没有改） |
 
 在 GitHub 网页上打开文件，点铅笔图标，全选后粘贴新内容，提交。完成后下载 `PkgCProbe`，解压得到 `PkgCProbe.kext`。编译失败时下载 `PkgCProbe-build-log` 发我。
 
 ## 安装（OpenCore）
 
-用新的 `PkgCProbe.kext` 整个替换 `EFI/OC/Kexts/PkgCProbe.kext`。config.plist 不用改。
+- 用新的 `PkgCProbe.kext` 整个替换 `EFI/OC/Kexts/PkgCProbe.kext`。
+- RealtekRTL8111 的 `disableASPM` 保持现在的 false（r5 会读出芯片自己的 ASPM 开关）。
+- ADJP 的补丁见 `ACPI-ADJP/README.md`，可以和这次一起重启。
 
-## 测试（r4）
+## 测试（r5）
 
-1. 重启，登录后不碰电脑约 8 分钟（插电或电池都可以，屏幕亮着即可）。
+1. 插上电源重启，登录后不碰电脑约 9 分钟（屏幕亮着即可；USB 设备和网络保持平时的样子）。
 2. 在终端运行（只读）：
 
 ```bash
-ioreg -rc PkgCProbe -w0 > ~/Desktop/pkgc4.txt
+ioreg -rc PkgCProbe -w0 > ~/Desktop/pkgc6.txt
 ```
 
-3. 把桌面上的 `pkgc4.txt` 发我。
+3. 把桌面上的 `pkgc6.txt` 发我。
 
 ## 选项
 
@@ -76,10 +90,11 @@ ioreg -rc PkgCProbe -w0 > ~/Desktop/pkgc4.txt
 
 | 键 | 本目录的值 | 说明 |
 |---|---|---|
-| StartDelay | 180 | 驱动启动后多少秒开始测试（30 到 3600） |
+| StartDelay | 300 | 驱动启动后多少秒开始测试（30 到 3600） |
 | PhaseSeconds | 15 | 每段测多少秒（5 到 120） |
-| RunTest | true | 设为 false 则不测试（ApplyMask 在开机时直接生效，也不会改 PEG0） |
+| RunTest | true | 设为 false 则不测试；ApplyMask 开机即生效，SataAlpm 在 StartDelay 秒后生效 |
 | ApplyMask | 4 | 测完后一直不计的 LTR 位；4 = SATA，0 = 不保持 |
+| SataAlpm | false | 设为 true：测完后（RunTest 为 false 时，在开机 StartDelay 秒后）通过驱动一直开着 SATA ALPM，每次唤醒 5 秒后再开一次。先看 r5 的结果再决定，现在请保持 false |
 
 ## 停用
 
@@ -87,7 +102,8 @@ ioreg -rc PkgCProbe -w0 > ~/Desktop/pkgc4.txt
 
 ## 修改记录
 
-- r4（2026-11-18）：只读 DMI 链路芯片组一侧；新增 3 段 PEG0 测试（D3hot、通道断电、束断电，每段后写回）；去掉“只不计 XHCI”“SATA+XHCI”两段；每段多报 PC8 到 PC10；PEG0 的束寄存器读全 8 个。
-- r3（2026-11-18）：只读 DMI 链路和 PEG0 的寄存器，在开机时、测完后、前三次唤醒后各读一次。Info.plist 的 ApplyMask 改为 4。
-- r2（2026-11-17）：编译脚本改为按内容查找源文件，并在日志里列出仓库文件。映射 PMC 寄存器改用 `map()`，查找 SATA 控制器改为在 PMC 所在的 PCI 总线上找。
+- r5（2026-11-18）：去掉 PEG0 和 DMI 部分（已排除）。新增测试前的只读概览：芯片组模块断电状态（PPFEAR）、PCIe 根端口和设备、xHCI 端口、HD Audio 数据流、RTL8111 芯片自己的 ASPM 开关、更多 AHCI 寄存器。测试改为 6 段，其中 4 段通过 AHCI 驱动开启 SATA ALPM（含 Slumber）。新增选项 SataAlpm。每段多报芯片组模块的断电次数。
+- r4（2026-11-18）：只读 DMI 链路芯片组一侧；新增 3 段 PEG0 测试（D3hot、通道断电、束断电，每段后写回）；每段多报 PC8 到 PC10。
+- r3（2026-11-18）：只读 DMI 链路和 PEG0 的寄存器。Info.plist 的 ApplyMask 改为 4。
+- r2（2026-11-17）：编译脚本改为按内容查找源文件。映射 PMC 寄存器改用 `map()`，查找 SATA 控制器改为在 PMC 所在的 PCI 总线上找。
 - r1（2026-11-17）：第一版。
