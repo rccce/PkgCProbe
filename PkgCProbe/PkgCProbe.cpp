@@ -37,6 +37,16 @@
  * configuration window (ECAM) the registers 0x248, 0xC20, 0xC38, 0x91C-0x97C and 0xC74
  * that the firmware's dGPU power-off sequence uses on Coffee Lake MacBook Pros.
  * Read at start, after the test and after each of the first three wakes.
+ *
+ * r4: (1) also reads (never writes) the chipset side of the DMI link through the sideband
+ * registers (SBREG_BAR 0xFD000000, port 0xEF, offsets 0x21A4/0x21A8), checked against the TCO
+ * base that the SMBus controller (00:1f.4, config 0x50) reports. (2) Three new test phases with
+ * all LTRs ignored try what the firmware's own non-Windows-10 power-off path and Apple's PWRD do
+ * to the parked PEG0 port: D3hot (PMCSR), lane power gating (0xC20 bits 5:4 = 3, 0xC38 bit 3)
+ * and bundle power gating (bit 31 of 0x91C-0x9FC). Only if PEG0 is 8086:1901 with no device
+ * behind it, its link down and the L2/L3 handshake done (0x248 bit 14). Every value is written
+ * back right after its phase, also if the Mac goes to sleep or the kext stops.
+ * Phases also report package C8/C9/C10.
  */
 
 #include <IOKit/IOService.h>
@@ -57,6 +67,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
+#include <string.h>
 #include <stdarg.h>
 
 namespace {
@@ -92,21 +103,30 @@ constexpr unsigned kLtrCount = sizeof(kLtr) / sizeof(kLtr[0]);
 const unsigned kShown[] = {2, 4, 5, 8};      // SATA, XHCI, ME, HDA
 
 constexpr UInt32 kIgnoreSATA = 1u << 2;
-constexpr UInt32 kIgnoreXHCI = 1u << 4;
 constexpr UInt32 kIgnoreAll  = 0x0003FBDF;   // bits 0-4, 6-9 and 11-17; 5 and 10 are reserved
+
+// r4: what a phase does to PEG0 (00:01.0) besides the ignore register
+enum PegAction : UInt32 {
+    kPegNone    = 0,
+    kPegD3      = 1u << 0,      // PMCSR power state D3hot
+    kPegLanes   = 1u << 1,      // 0xC20 bits 5:4 = 3 and 0xC38 bit 3 = 1 (lane power gating)
+    kPegBundles = 1u << 2,      // bit 31 of the eight bundle registers 0x91C-0x9FC
+};
 
 struct Phase {
     UInt32 mask;
+    UInt32 peg;
     const char *name;
 };
 
 const Phase kPhases[] = {
-    {0,                         "baseline"},
-    {kIgnoreSATA,               "ignore SATA"},
-    {kIgnoreXHCI,               "ignore XHCI"},
-    {kIgnoreSATA | kIgnoreXHCI, "ignore SATA+XHCI"},
-    {kIgnoreAll,                "ignore all"},
-    {0,                         "baseline again"},
+    {0,           kPegNone,                          "baseline"},
+    {kIgnoreSATA, kPegNone,                          "ignore SATA"},
+    {kIgnoreAll,  kPegNone,                          "ignore all"},
+    {kIgnoreAll,  kPegD3,                            "ignore all + PEG0 D3hot"},
+    {kIgnoreAll,  kPegLanes,                         "ignore all + PEG0 lanes gated"},
+    {kIgnoreAll,  kPegD3 | kPegLanes | kPegBundles,  "ignore all + PEG0 D3hot, lanes and bundles gated"},
+    {0,           kPegNone,                          "baseline again"},
 };
 constexpr unsigned kPhaseCount = sizeof(kPhases) / sizeof(kPhases[0]);
 
@@ -127,9 +147,21 @@ constexpr UInt32 kPegL23         = 0x248;         // bit 7 L2/L3-ready request, 
 constexpr UInt32 kPegC20         = 0xC20;
 constexpr UInt32 kPegC38         = 0xC38;
 constexpr UInt32 kPegLtssm       = 0xC74;
-const UInt32 kPegBundles[] = {0x91C, 0x93C, 0x95C, 0x97C};
+const UInt32 kPegBundleRegs[] = {0x91C, 0x93C, 0x95C, 0x97C, 0x99C, 0x9BC, 0x9DC, 0x9FC};   // BSP1-BSP8 in the PegSsdt
+constexpr unsigned kPegBundleCount = sizeof(kPegBundleRegs) / sizeof(kPegBundleRegs[0]);
 constexpr unsigned kLtssmReads   = 20;            // 0.5 ms apart
 constexpr UInt32 kMaxWakeDumps   = 3;
+constexpr UInt32 kPegId          = 0x19018086;    // Skylake/Kaby Lake PEG10 (x16)
+
+// Chipset side of DMI (r4, read only): sideband registers of the DMI port (port ID 0xEF)
+constexpr UInt64 kSbregDefault   = 0xFD000000;    // Intel reference SBREG_BAR on Sunrise Point
+constexpr UInt32 kPidDmi         = 0xEF;
+constexpr UInt32 kPcrDmiWindow   = 0x2000;        // map 0x2000-0x2FFF of the port
+constexpr UInt32 kPcrDmiLinkCap  = 0x21A4;
+constexpr UInt32 kPcrDmiLinkCtl  = 0x21A8;        // bits 15:0 link control, 31:16 link status
+constexpr UInt32 kPcrDmiTcoBase  = 0x2778;
+constexpr UInt8  kSmbusTcoBase   = 0x50;          // SMBus 00:1f.4: TCO base on Sunrise Point
+constexpr int    kDevFnSmbus     = 0xFC;          // 00:1f.4
 
 // MSRs used; all exist on Skylake/Kaby Lake client CPUs (family 6, models 4E/5E/8E/9E).
 constexpr UInt32 kMsrPkgCstConfig = 0xE2;
@@ -143,6 +175,9 @@ constexpr UInt32 kMsrPkgC7Irtl    = 0x60C;
 constexpr UInt32 kMsrPkgC2Res     = 0x60D;
 constexpr UInt32 kMsrPkgEnergy    = 0x611;
 constexpr UInt32 kMsrDramEnergy   = 0x619;
+constexpr UInt32 kMsrPkgC8Res     = 0x630;
+constexpr UInt32 kMsrPkgC9Res     = 0x631;
+constexpr UInt32 kMsrPkgC10Res    = 0x632;
 constexpr UInt32 kMsrPkgAnyCoreC0 = 0x659;
 
 inline UInt64 pcpReadMsr(UInt32 msr)
@@ -306,7 +341,7 @@ public:
     const char *c_str() const { return text; }
 
 private:
-    char text[768];
+    char text[1024];
     size_t length {0};
 };
 
@@ -317,6 +352,9 @@ struct PcpSnapshot {
     UInt64 pc3;
     UInt64 pc6;
     UInt64 pc7;
+    UInt64 pc8;
+    UInt64 pc9;
+    UInt64 pc10;
     UInt64 busy;
     UInt32 pkgEnergy;
     UInt32 dramEnergy;
@@ -380,6 +418,21 @@ private:
     UInt32 limitMax {0};
     UInt32 samples {0};
 
+    // r4: PEG0 test phases
+    IOPCIDevice *pegDevice {nullptr};
+    IOMemoryMap *pegMap {nullptr};
+    volatile UInt32 *pegCfg {nullptr};
+    UInt32 pegPm {0};                        // PCI power management capability offset
+    UInt32 pegExpress {0};                   // PCI Express capability offset
+    bool pegReady {false};
+    UInt32 pegApplied {0};                   // kPeg* bits that are changed right now
+    UInt32 pegPmcsr {0};                     // values as found before the test
+    UInt32 pegC20 {0};
+    UInt32 pegC38 {0};
+    UInt32 pegBundle[kPegBundleCount] {};
+    char pegWhy[96] {};
+    char pegNote[320] {};
+
     UInt32 readPwrm(UInt32 offset) const { return pwrm[offset / 4]; }
     bool tryPwrm(UInt32 base);
     void addResult(const char *text);
@@ -388,9 +441,16 @@ private:
     void describeLtr(const char *title);
     void findAhci();
     UInt64 ecamBase(IOPCIDevice *host);
+    void findBusZero(IOPCIDevice **host, IOPCIDevice **peg, IOPCIDevice **smbus);
     void describeDmi(const char *when, IOPCIDevice *host);
+    void describePchDmi(const char *when, IOPCIDevice *smbus);
     void describePeg(const char *when, IOPCIDevice *host, IOPCIDevice *peg);
     void describeCpuIo(const char *when);
+    bool pegHasDevice(IOPCIDevice *peg);
+    void pegPrepare();
+    void pegApply(UInt32 action);
+    bool pegRestore();
+    void pegRelease();
     void writeIgnore(UInt32 value);
     void takeSnapshot(PcpSnapshot *snapshot);
     void resetSamples();
@@ -505,7 +565,9 @@ void PkgCProbe::releaseResources()
         workLoop->release();
         workLoop = nullptr;
     }
-    // Nothing runs on the work loop any more: put the ignore register back if a test was cut short.
+    // Nothing runs on the work loop any more: put PEG0 and the ignore register back if a test was cut short.
+    pegRestore();
+    pegRelease();
     if (state == kRunning && ignoreChanged && writable && pwrm != nullptr) {
         pwrm[kLtrIgnore / 4] = ignoreOriginal;
         ignoreChanged = false;
@@ -610,7 +672,7 @@ void PkgCProbe::describeStart()
     PcpLine line;
     UInt32 regs[4];
     pcpCpuid(1, regs);
-    line.add("r3; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
+    line.add("r4; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
     if (pwrm == nullptr)
         line.add("; no PMC LTR registers found there or at 0x%08x: read-only, nothing will be changed", kPwrmDefault);
     else
@@ -832,8 +894,8 @@ void PkgCProbe::describePeg(const char *when, IOPCIDevice *host, IOPCIDevice *pe
         UInt32 c38 = cfg[kPegC38 / 4];
         extra.add(" ECAM 0x%llx; 0x248 0x%08x (bit7 %u, bit8 %u, bit14 %u), 0xC20 0x%08x (bits5:4 %u), 0xC38 0x%08x (bit3 %u)",
                   ecam, l23, (l23 >> 7) & 1, (l23 >> 8) & 1, (l23 >> 14) & 1, c20, (c20 >> 4) & 3, c38, (c38 >> 3) & 1);
-        for (unsigned i = 0; i < sizeof(kPegBundles) / sizeof(kPegBundles[0]); i++)
-            extra.add(", 0x%X 0x%08x", kPegBundles[i], cfg[kPegBundles[i] / 4]);
+        for (unsigned i = 0; i < sizeof(kPegBundleRegs) / sizeof(kPegBundleRegs[0]); i++)
+            extra.add(", 0x%X 0x%08x", kPegBundleRegs[i], cfg[kPegBundleRegs[i] / 4]);
         UInt32 values[4] = {};
         UInt32 counts[4] = {};
         unsigned distinct = 0;
@@ -866,35 +928,278 @@ void PkgCProbe::describePeg(const char *when, IOPCIDevice *host, IOPCIDevice *pe
     addResult(extra.c_str());
 }
 
+// Host bridge 00:00.0, PEG0 00:01.0 and SMBus 00:1f.4 among the PMC's siblings on bus 0 (retained).
+void PkgCProbe::findBusZero(IOPCIDevice **host, IOPCIDevice **peg, IOPCIDevice **smbus)
+{
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children == nullptr)
+        return;
+    OSObject *child = nullptr;
+    while ((child = children->getNextObject()) != nullptr) {
+        IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
+        if (device == nullptr)
+            continue;
+        int devfn = pciDevFn(device);
+        IOPCIDevice **slot = nullptr;
+        if (devfn == 0x00)
+            slot = host;
+        else if (devfn == 0x08)
+            slot = peg;
+        else if (devfn == kDevFnSmbus)
+            slot = smbus;
+        if (slot != nullptr && *slot == nullptr) {
+            *slot = device;
+            device->retain();
+        }
+    }
+    children->release();
+}
+
+// Chipset side of DMI, read through the sideband window. Trusted only if the TCO base there
+// matches the one the SMBus controller reports.
+void PkgCProbe::describePchDmi(const char *when, IOPCIDevice *smbus)
+{
+    PcpLine line;
+    line.add("PCH DMI %s:", when);
+    UInt32 smbusTco = smbus != nullptr ? (smbus->configRead32(kSmbusTcoBase) & 0xFFE0) : 0;
+    IOMemoryMap *mapping = nullptr;
+    IODeviceMemory *memory = IODeviceMemory::withRange(kSbregDefault + (static_cast<UInt64>(kPidDmi) << 16) + kPcrDmiWindow,
+                                                       kMapLength);
+    if (memory != nullptr) {
+        mapping = memory->map(kIOMapInhibitCache);
+        memory->release();
+    }
+    if (mapping == nullptr) {
+        line.add(" sideband window 0x%llx not mapped; not read", kSbregDefault);
+        addResult(line.c_str());
+        return;
+    }
+    volatile UInt32 *pcr = reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress());
+    UInt32 tco = pcr[(kPcrDmiTcoBase - kPcrDmiWindow) / 4] & 0xFFE0;
+    UInt32 cap = pcr[(kPcrDmiLinkCap - kPcrDmiWindow) / 4];
+    UInt32 control = pcr[(kPcrDmiLinkCtl - kPcrDmiWindow) / 4];
+    mapping->release();
+    bool verified = smbusTco != 0 && tco == smbusTco;
+    UInt32 lctl = control & 0xFFFF;
+    UInt32 lsts = control >> 16;
+    line.add(" SBREG 0x%llx, TCO base 0x%04x, SMBus TCO base 0x%04x (%s); LCAP 0x%08x (ASPM support %s, L0s exit %u, "
+             "L1 exit %u), LCTL 0x%04x (ASPM %s), LSTS 0x%04x (Gen%u x%u)",
+             kSbregDefault, tco, smbusTco, verified ? "match" : "NO MATCH: the values may not be the DMI port",
+             cap, aspmName((cap >> 10) & 3), (cap >> 12) & 7, (cap >> 15) & 7, lctl, aspmName(lctl & 3),
+             lsts, lsts & 0xF, (lsts >> 4) & 0x3F);
+    addResult(line.c_str());
+}
+
 void PkgCProbe::describeCpuIo(const char *when)
 {
     IOPCIDevice *host = nullptr;
     IOPCIDevice *peg = nullptr;
-    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
-    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
-    if (children != nullptr) {
-        OSObject *child = nullptr;
-        while ((child = children->getNextObject()) != nullptr) {
-            IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
-            if (device == nullptr)
-                continue;
-            int devfn = pciDevFn(device);
-            if (devfn == 0x00 && host == nullptr) {
-                host = device;
-                host->retain();
-            } else if (devfn == 0x08 && peg == nullptr) {
-                peg = device;
-                peg->retain();
-            }
-        }
-        children->release();
-    }
+    IOPCIDevice *smbus = nullptr;
+    findBusZero(&host, &peg, &smbus);
     describeDmi(when, host);
+    describePchDmi(when, smbus);
     describePeg(when, host, peg);
     if (host != nullptr)
         host->release();
     if (peg != nullptr)
         peg->release();
+    if (smbus != nullptr)
+        smbus->release();
+}
+
+// True if any PCI device is registered behind PEG0 (two levels down: bridge driver, then devices).
+bool PkgCProbe::pegHasDevice(IOPCIDevice *peg)
+{
+    bool found = false;
+    OSIterator *level1 = peg->getChildIterator(gIOServicePlane);
+    if (level1 == nullptr)
+        return true;                         // cannot tell: treat as "has a device"
+    OSObject *a = nullptr;
+    while (!found && (a = level1->getNextObject()) != nullptr) {
+        if (OSDynamicCast(IOPCIDevice, a) != nullptr) {
+            found = true;
+            break;
+        }
+        IORegistryEntry *entry = OSDynamicCast(IORegistryEntry, a);
+        OSIterator *level2 = entry != nullptr ? entry->getChildIterator(gIOServicePlane) : nullptr;
+        if (level2 == nullptr)
+            continue;
+        OSObject *b = nullptr;
+        while ((b = level2->getNextObject()) != nullptr) {
+            if (OSDynamicCast(IOPCIDevice, b) != nullptr) {
+                found = true;
+                break;
+            }
+        }
+        level2->release();
+    }
+    level1->release();
+    return found;
+}
+
+// Before the test: decide whether the PEG0 phases may write, and keep the values to restore.
+void PkgCProbe::pegPrepare()
+{
+    pegReady = false;
+    pegApplied = 0;
+    pegWhy[0] = '\0';
+    IOPCIDevice *host = nullptr;
+    IOPCIDevice *peg = nullptr;
+    findBusZero(&host, &peg, nullptr);
+    const char *why = nullptr;
+    UInt32 id = peg != nullptr ? peg->configRead32(0x00) : 0;
+    if (!writable)
+        why = "read-only mode";
+    else if (!msrUsable)
+        why = "not a Skylake/Kaby Lake CPU";
+    else if (peg == nullptr)
+        why = "no PCI device 00:01.0";
+    else if (id != kPegId)
+        why = "00:01.0 is not 8086:1901";
+    else if (pegHasDevice(peg))
+        why = "a device is attached behind PEG0";
+
+    IOMemoryMap *mapping = nullptr;
+    volatile UInt32 *cfg = nullptr;
+    if (why == nullptr) {
+        UInt64 ecam = ecamBase(host);
+        IODeviceMemory *memory = ecam != 0 ? IODeviceMemory::withRange(ecam + kEcamPeg, kMapLength) : nullptr;
+        if (memory != nullptr) {
+            mapping = memory->map(kIOMapInhibitCache);
+            memory->release();
+        }
+        cfg = mapping != nullptr ? reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress()) : nullptr;
+        if (cfg == nullptr)
+            why = "ECAM not mapped";
+        else if (cfg[0] != id)
+            why = "ECAM does not show 00:01.0";
+    }
+    UInt32 pm = 0;
+    UInt32 express = 0;
+    if (why == nullptr) {
+        pm = findCapability(peg, 0x01);
+        express = findCapability(peg, 0x10);
+        if (pm == 0 || express == 0) {
+            why = "PEG0 capabilities not found";
+        } else {
+            UInt32 pmcsr = cfg[(pm + 4) / 4];
+            UInt32 lsts = cfg[(express + 0x10) / 4] >> 16;
+            if ((pmcsr & 3) != 0)
+                why = "PEG0 is not in D0";
+            else if (((lsts >> 13) & 1) != 0)
+                why = "PEG0 link is up";
+            else if (((cfg[kPegL23 / 4] >> 14) & 1) == 0)
+                why = "PEG0 L2/L3 handshake not done (0x248 bit 14 is 0)";
+        }
+    }
+    if (host != nullptr)
+        host->release();
+    if (why != nullptr) {
+        snprintf(pegWhy, sizeof(pegWhy), "%s", why);
+        if (mapping != nullptr)
+            mapping->release();
+        if (peg != nullptr)
+            peg->release();
+        PcpLine line;
+        line.add("PEG0 phases: nothing will be written (%s)", why);
+        addResult(line.c_str());
+        return;
+    }
+
+    pegDevice = peg;                         // keeps the retain from findBusZero
+    pegMap = mapping;
+    pegCfg = cfg;
+    pegPm = pm;
+    pegExpress = express;
+    pegPmcsr = cfg[(pm + 4) / 4];
+    pegC20 = cfg[kPegC20 / 4];
+    pegC38 = cfg[kPegC38 / 4];
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        pegBundle[i] = cfg[kPegBundleRegs[i] / 4];
+    pegReady = true;
+    PcpLine line;
+    line.add("PEG0 phases: ready; will restore PMCSR 0x%04x, 0xC20 0x%08x, 0xC38 0x%08x, bundles",
+             pegPmcsr & 0xFFFF, pegC20, pegC38);
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        line.add(" 0x%08x", pegBundle[i]);
+    addResult(line.c_str());
+}
+
+// Changes PEG0 for one phase. The order follows the firmware's PGOF: lanes, bundles, then D3hot.
+void PkgCProbe::pegApply(UInt32 action)
+{
+    pegNote[0] = '\0';
+    if (action == kPegNone)
+        return;
+    if (!pegReady || pegCfg == nullptr) {
+        snprintf(pegNote, sizeof(pegNote), "PEG0 not changed: %s", pegWhy[0] != '\0' ? pegWhy : "not prepared");
+        return;
+    }
+    if ((action & kPegLanes) != 0) {
+        pegApplied |= kPegLanes;
+        pegCfg[kPegC38 / 4] = pegC38 | 0x8;
+        pegCfg[kPegC20 / 4] = (pegC20 & ~0x30u) | 0x30;
+    }
+    if ((action & kPegBundles) != 0) {
+        pegApplied |= kPegBundles;
+        for (unsigned i = 0; i < kPegBundleCount; i++)
+            pegCfg[kPegBundleRegs[i] / 4] = pegBundle[i] | 0x80000000u;
+    }
+    if ((action & kPegD3) != 0) {
+        pegApplied |= kPegD3;
+        pegCfg[(pegPm + 4) / 4] = (pegPmcsr & ~0x8003u) | 3;     // D3hot; bit 15 (PME status) is never written as 1
+        IOSleep(10);
+    }
+    unsigned gated = 0;
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        gated += (pegCfg[kPegBundleRegs[i] / 4] >> 31) & 1;
+    snprintf(pegNote, sizeof(pegNote), "PEG0 set: PMCSR 0x%04x, 0xC20 0x%08x, 0xC38 0x%08x, bundles gated %u/%u, LNKSTS 0x%04x",
+             pegCfg[(pegPm + 4) / 4] & 0xFFFF, pegCfg[kPegC20 / 4], pegCfg[kPegC38 / 4], gated, kPegBundleCount,
+             pegCfg[(pegExpress + 0x10) / 4] >> 16);
+}
+
+// Puts back what pegApply changed: D0 first, then lanes, then bundles (as the firmware's PGON).
+bool PkgCProbe::pegRestore()
+{
+    if (pegApplied == 0 || pegCfg == nullptr)
+        return false;
+    if ((pegApplied & kPegD3) != 0) {
+        pegCfg[(pegPm + 4) / 4] = pegPmcsr & ~0x8000u;
+        IOSleep(10);
+    }
+    if ((pegApplied & kPegLanes) != 0) {
+        pegCfg[kPegC20 / 4] = pegC20;
+        pegCfg[kPegC38 / 4] = pegC38;
+    }
+    if ((pegApplied & kPegBundles) != 0) {
+        for (unsigned i = 0; i < kPegBundleCount; i++)
+            pegCfg[kPegBundleRegs[i] / 4] = pegBundle[i];
+    }
+    pegApplied = 0;
+    bool same = (pegCfg[(pegPm + 4) / 4] & 3) == (pegPmcsr & 3) && pegCfg[kPegC20 / 4] == pegC20 &&
+                pegCfg[kPegC38 / 4] == pegC38;
+    for (unsigned i = 0; i < kPegBundleCount; i++)
+        same = same && pegCfg[kPegBundleRegs[i] / 4] == pegBundle[i];
+    size_t used = strlen(pegNote);
+    if (used < sizeof(pegNote))
+        snprintf(pegNote + used, sizeof(pegNote) - used, "%sPEG0 %s (0x248 0x%08x, 0xC74 0x%08x)",
+                 used != 0 ? "; " : "", same ? "restored" : "RESTORE MISMATCH", pegCfg[kPegL23 / 4], pegCfg[kPegLtssm / 4]);
+    return true;
+}
+
+void PkgCProbe::pegRelease()
+{
+    pegReady = false;
+    pegCfg = nullptr;
+    if (pegMap != nullptr) {
+        pegMap->release();
+        pegMap = nullptr;
+    }
+    if (pegDevice != nullptr) {
+        pegDevice->release();
+        pegDevice = nullptr;
+    }
 }
 
 void PkgCProbe::writeIgnore(UInt32 value)
@@ -920,11 +1225,15 @@ void PkgCProbe::takeSnapshot(PcpSnapshot *snapshot)
         snapshot->pc3 = pcpReadMsr(kMsrPkgC3Res);
         snapshot->pc6 = pcpReadMsr(kMsrPkgC6Res);
         snapshot->pc7 = pcpReadMsr(kMsrPkgC7Res);
+        snapshot->pc8 = pcpReadMsr(kMsrPkgC8Res);
+        snapshot->pc9 = pcpReadMsr(kMsrPkgC9Res);
+        snapshot->pc10 = pcpReadMsr(kMsrPkgC10Res);
         snapshot->busy = pcpReadMsr(kMsrPkgAnyCoreC0);
         snapshot->pkgEnergy = static_cast<UInt32>(pcpReadMsr(kMsrPkgEnergy));
         snapshot->dramEnergy = static_cast<UInt32>(pcpReadMsr(kMsrDramEnergy));
     } else {
         snapshot->pc2 = snapshot->pc3 = snapshot->pc6 = snapshot->pc7 = snapshot->busy = 0;
+        snapshot->pc8 = snapshot->pc9 = snapshot->pc10 = 0;
         snapshot->pkgEnergy = snapshot->dramEnergy = 0;
     }
 }
@@ -1034,6 +1343,9 @@ void PkgCProbe::report(const PcpSnapshot &last)
         line.addPercent("PC3", permille(last.pc3 - first.pc3, ticks));
         line.addPercent("PC6", permille(last.pc6 - first.pc6, ticks));
         line.addPercent("PC7", permille(last.pc7 - first.pc7, ticks));
+        line.addPercent("PC8", permille(last.pc8 - first.pc8, ticks));
+        line.addPercent("PC9", permille(last.pc9 - first.pc9, ticks));
+        line.addPercent("PC10", permille(last.pc10 - first.pc10, ticks));
         line.addPercent("busy", permille(last.busy - first.busy, ticks));
         UInt64 ns = last.ns - first.ns;
         UInt64 package = milliwatts(last.pkgEnergy - first.pkgEnergy, energyUnit, ns);
@@ -1066,6 +1378,8 @@ void PkgCProbe::report(const PcpSnapshot &last)
     }
     line.add(" | bus delay ");
     addBusDelay(line);
+    if (current.peg != kPegNone && pegNote[0] != '\0')
+        line.add(" | %s", pegNote);
     addResult(line.c_str());
 }
 
@@ -1073,6 +1387,7 @@ void PkgCProbe::beginTest()
 {
     findAhci();
     describeLtr("LTR before the test:");
+    pegPrepare();
     state = kRunning;
     phase = 0;
     tick = 0;
@@ -1088,6 +1403,7 @@ void PkgCProbe::stepTest()
 
     if (tick == 0) {
         writeIgnore(ignored);
+        pegApply(kPhases[phase].peg);
     } else if (tick == kSettleTicks) {
         takeSnapshot(&first);
         resetSamples();
@@ -1096,6 +1412,7 @@ void PkgCProbe::stepTest()
         if (tick >= kSettleTicks + measureTicks) {
             PcpSnapshot last;
             takeSnapshot(&last);
+            pegRestore();
             report(last);
             tick = 0;
             phase++;
@@ -1115,6 +1432,9 @@ void PkgCProbe::finishTest(const char *why)
 {
     if (timer != nullptr)
         timer->cancelTimeout();
+    if (pegRestore())
+        addResult(pegNote);
+    pegRelease();
     if (ignoreChanged)
         writeIgnore(ignoreOriginal);
     state = kDone;
