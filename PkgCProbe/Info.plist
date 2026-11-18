@@ -27,7 +27,7 @@
 		<key>PkgCProbe</key>
 		<dict>
 			<key>ApplyMask</key>
-			<integer>0</integer>
+			<integer>4</integer>
 			<key>CFBundleIdentifier</key>
 			<string>local.PkgCProbe</string>
 			<key>IOClass</key>

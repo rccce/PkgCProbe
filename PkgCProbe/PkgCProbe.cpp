@@ -30,6 +30,13 @@
  *
  * r2: the PMC registers are mapped with IOMemoryDescriptor::map() (no kernel_task), and the
  * AHCI controller is looked up among the PMC's siblings on PCI bus 0 (no matching dictionary).
+ *
+ * r3: also reads (never writes) the CPU side of the I/O: the DMI link control of the host
+ * bridge (00:00.0, DMIBAR+0x84/0x88) and the state of the CPU's PCIe graphics port PEG0
+ * (00:01.0): command, bus numbers, PMCSR, link and slot registers, and through the PCIe
+ * configuration window (ECAM) the registers 0x248, 0xC20, 0xC38, 0x91C-0x97C and 0xC74
+ * that the firmware's dGPU power-off sequence uses on Coffee Lake MacBook Pros.
+ * Read at start, after the test and after each of the first three wakes.
  */
 
 #include <IOKit/IOService.h>
@@ -44,6 +51,7 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
@@ -106,6 +114,22 @@ constexpr UInt32 kTickMS       = 500;
 constexpr UInt32 kSettleTicks  = 4;          // 2 s between changing the ignore register and measuring
 constexpr UInt32 kWakeApplyMS  = 1000;
 constexpr UInt32 kMaxApplyLogs = 3;
+
+// CPU side of the I/O (r3, read only)
+constexpr UInt8  kHostDeven      = 0x54;          // host bridge 00:00.0: device enable
+constexpr UInt8  kHostPciexbar   = 0x60;          // PCIe configuration window (ECAM) base
+constexpr UInt8  kHostDmibar     = 0x68;
+constexpr UInt32 kDmiLinkCap     = 0x84;
+constexpr UInt32 kDmiLinkControl = 0x88;          // bits 15:0 link control, 31:16 link status
+constexpr UInt32 kEcamPeg        = 1u << 15;      // bus 0, device 1, function 0
+constexpr UInt32 kMapLength      = 0x1000;
+constexpr UInt32 kPegL23         = 0x248;         // bit 7 L2/L3-ready request, bit 8 back to detect, bit 14 done
+constexpr UInt32 kPegC20         = 0xC20;
+constexpr UInt32 kPegC38         = 0xC38;
+constexpr UInt32 kPegLtssm       = 0xC74;
+const UInt32 kPegBundles[] = {0x91C, 0x93C, 0x95C, 0x97C};
+constexpr unsigned kLtssmReads   = 20;            // 0.5 ms apart
+constexpr UInt32 kMaxWakeDumps   = 3;
 
 // MSRs used; all exist on Skylake/Kaby Lake client CPUs (family 6, models 4E/5E/8E/9E).
 constexpr UInt32 kMsrPkgCstConfig = 0xE2;
@@ -196,6 +220,41 @@ const char *linkStateName(UInt32 ipm)
 UInt32 permille(UInt64 part, UInt64 whole)
 {
     return whole == 0 ? 0 : static_cast<UInt32>((part * 1000) / whole);
+}
+
+const char *aspmName(UInt32 bits)
+{
+    static const char *const names[] = {"off", "L0s", "L1", "L0s+L1"};
+    return names[bits & 3];
+}
+
+// Device and function of a PCI device on bus 0 from its "reg" property ((device << 3) | function), or -1.
+int pciDevFn(IORegistryEntry *entry)
+{
+    OSData *reg = OSDynamicCast(OSData, entry->getProperty("reg"));
+    if (reg == nullptr || reg->getLength() < 4)
+        return -1;
+    const UInt8 *bytes = static_cast<const UInt8 *>(reg->getBytesNoCopy());
+    UInt32 address = static_cast<UInt32>(bytes[0]) | (static_cast<UInt32>(bytes[1]) << 8) |
+                     (static_cast<UInt32>(bytes[2]) << 16) | (static_cast<UInt32>(bytes[3]) << 24);
+    if (((address >> 16) & 0xFF) != 0)
+        return -1;
+    return static_cast<int>((address >> 8) & 0xFF);
+}
+
+// Offset of a standard PCI capability, or 0. Uses 32-bit configuration reads only.
+UInt8 findCapability(IOPCIDevice *device, UInt8 id)
+{
+    if (((device->configRead32(0x04) >> 16) & 0x10) == 0)
+        return 0;
+    UInt8 next = static_cast<UInt8>(device->configRead32(0x34) & 0xFC);
+    for (unsigned guard = 0; next >= 0x40 && guard < 48; guard++) {
+        UInt32 header = device->configRead32(next);
+        if ((header & 0xFF) == id)
+            return next;
+        next = static_cast<UInt8>((header >> 8) & 0xFC);
+    }
+    return 0;
 }
 
 // RAPL energy counter delta (units of 2^-unit J) over ns, in milliwatts.
@@ -302,6 +361,8 @@ private:
     bool awake {true};
     bool applyPending {false};
     UInt32 applyCount {0};
+    bool dumpPending {false};
+    UInt32 wakeDumps {0};
     UInt32 phase {0};
     UInt32 tick {0};
 
@@ -326,6 +387,10 @@ private:
     void describeStart();
     void describeLtr(const char *title);
     void findAhci();
+    UInt64 ecamBase(IOPCIDevice *host);
+    void describeDmi(const char *when, IOPCIDevice *host);
+    void describePeg(const char *when, IOPCIDevice *host, IOPCIDevice *peg);
+    void describeCpuIo(const char *when);
     void writeIgnore(UInt32 value);
     void takeSnapshot(PcpSnapshot *snapshot);
     void resetSamples();
@@ -395,6 +460,7 @@ bool PkgCProbe::start(IOService *provider)
 
     describeStart();
     describeLtr("LTR at start:");
+    describeCpuIo("at start");
 
     // Without usable PMC registers the test still runs, but only measures (nothing is written).
     if (runTest) {
@@ -544,7 +610,7 @@ void PkgCProbe::describeStart()
     PcpLine line;
     UInt32 regs[4];
     pcpCpuid(1, regs);
-    line.add("r2; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
+    line.add("r3; CPUID 0x%08x; PMC config 0x48 = 0x%08x", regs[0], pwrmConfig);
     if (pwrm == nullptr)
         line.add("; no PMC LTR registers found there or at 0x%08x: read-only, nothing will be changed", kPwrmDefault);
     else
@@ -646,6 +712,189 @@ void PkgCProbe::findAhci()
     }
     if (ahciPort < 0)
         addResult("AHCI: no port with a device link");
+}
+
+// PCIe configuration window: AppleACPIPlatform's "acpi-mmcfg-seg0", else the host bridge's PCIEXBAR.
+UInt64 PkgCProbe::ecamBase(IOPCIDevice *host)
+{
+    UInt64 base = 0;
+    IOPlatformExpert *platform = IOService::getPlatform();
+    OSObject *object = platform != nullptr ? platform->copyProperty("acpi-mmcfg-seg0") : nullptr;
+    OSNumber *number = OSDynamicCast(OSNumber, object);
+    if (number != nullptr)
+        base = number->unsigned64BitValue();
+    if (object != nullptr)
+        object->release();
+    if (base == 0 && host != nullptr) {
+        UInt64 bar = (static_cast<UInt64>(host->configRead32(kHostPciexbar + 4)) << 32) |
+                     host->configRead32(kHostPciexbar);
+        if ((bar & 1) != 0)
+            base = bar & 0x7FFC000000ULL;
+    }
+    return base;
+}
+
+// Host bridge: which CPU-side devices are enabled, and the DMI link (to the chipset).
+void PkgCProbe::describeDmi(const char *when, IOPCIDevice *host)
+{
+    PcpLine line;
+    line.add("DMI %s:", when);
+    if (host == nullptr) {
+        line.add(" no PCI device 00:00.0");
+        addResult(line.c_str());
+        return;
+    }
+    UInt32 id = host->configRead32(0x00);
+    UInt32 deven = host->configRead32(kHostDeven);
+    UInt64 bar = (static_cast<UInt64>(host->configRead32(kHostDmibar + 4)) << 32) | host->configRead32(kHostDmibar);
+    line.add(" host bridge %04x:%04x, DEVEN 0x%08x (PEG10 %u, PEG11 %u, PEG12 %u, IGPU %u, 00:04.0 %u), DMIBAR 0x%llx",
+             id & 0xFFFF, id >> 16, deven, (deven >> 3) & 1, (deven >> 2) & 1, (deven >> 1) & 1,
+             (deven >> 4) & 1, (deven >> 7) & 1, bar);
+    UInt64 base = bar & 0x7FFFFFF000ULL;
+    IOMemoryMap *mapping = nullptr;
+    if ((bar & 1) != 0 && base != 0) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(base, kMapLength);
+        if (memory != nullptr) {
+            mapping = memory->map(kIOMapInhibitCache);
+            memory->release();
+        }
+    }
+    if (mapping == nullptr) {
+        line.add("; DMI registers not read");
+    } else {
+        volatile UInt32 *dmi = reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress());
+        UInt32 cap = dmi[kDmiLinkCap / 4];
+        UInt32 control = dmi[kDmiLinkControl / 4];
+        UInt32 lctl = control & 0xFFFF;
+        UInt32 lsts = control >> 16;
+        line.add("; LCAP 0x%08x (ASPM support %s, L1 exit %u), LCTL 0x%04x (ASPM %s), LSTS 0x%04x (Gen%u x%u)",
+                 cap, aspmName((cap >> 10) & 3), (cap >> 15) & 7, lctl, aspmName(lctl & 3),
+                 lsts, lsts & 0xF, (lsts >> 4) & 0x3F);
+        mapping->release();
+    }
+    addResult(line.c_str());
+}
+
+// PEG0 (00:01.0): standard registers through IOPCIDevice, the rest through ECAM. Read only.
+void PkgCProbe::describePeg(const char *when, IOPCIDevice *host, IOPCIDevice *peg)
+{
+    PcpLine line;
+    line.add("PEG0 %s:", when);
+    if (peg == nullptr) {
+        line.add(" no PCI device 00:01.0");
+        addResult(line.c_str());
+        return;
+    }
+    UInt32 id = peg->configRead32(0x00);
+    UInt32 command = peg->configRead32(0x04);
+    UInt32 buses = peg->configRead32(0x18);
+    line.add(" %04x:%04x, command/status 0x%08x, buses 0x%08x (secondary %u, subordinate %u)",
+             id & 0xFFFF, id >> 16, command, buses, (buses >> 8) & 0xFF, (buses >> 16) & 0xFF);
+    UInt8 pm = findCapability(peg, 0x01);
+    if (pm != 0) {
+        UInt32 pmcsr = peg->configRead32(static_cast<UInt8>(pm + 4)) & 0xFFFF;
+        line.add(", PMCSR 0x%04x (D%u)", pmcsr, pmcsr & 3);
+    }
+    UInt8 express = findCapability(peg, 0x10);
+    if (express != 0) {
+        UInt32 link = peg->configRead32(static_cast<UInt8>(express + 0x10));
+        UInt32 slot = peg->configRead32(static_cast<UInt8>(express + 0x18));
+        UInt32 link2 = peg->configRead32(static_cast<UInt8>(express + 0x30));
+        UInt32 lctl = link & 0xFFFF;
+        UInt32 lsts = link >> 16;
+        line.add(", LNKCTL 0x%04x (ASPM %s, link disable %u, clock PM %u), LNKSTS 0x%04x (Gen%u x%u, training %u, "
+                 "DLL active %u), SLTCTL 0x%04x, SLTSTS 0x%04x (presence %u), LNKCTL2 0x%04x",
+                 lctl, aspmName(lctl & 3), (lctl >> 4) & 1, (lctl >> 8) & 1,
+                 lsts, lsts & 0xF, (lsts >> 4) & 0x3F, (lsts >> 11) & 1, (lsts >> 13) & 1,
+                 slot & 0xFFFF, slot >> 16, (slot >> 22) & 1, link2 & 0xFFFF);
+    }
+    addResult(line.c_str());
+
+    PcpLine extra;
+    extra.add("PEG0 %s, extended:", when);
+    UInt64 ecam = ecamBase(host);
+    IOMemoryMap *mapping = nullptr;
+    if (ecam != 0) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(ecam + kEcamPeg, kMapLength);
+        if (memory != nullptr) {
+            mapping = memory->map(kIOMapInhibitCache);
+            memory->release();
+        }
+    }
+    volatile UInt32 *cfg = mapping != nullptr ? reinterpret_cast<volatile UInt32 *>(mapping->getVirtualAddress()) : nullptr;
+    if (cfg == nullptr) {
+        extra.add(" ECAM 0x%llx could not be mapped; not read", ecam);
+    } else if (cfg[0] != id) {
+        extra.add(" ECAM 0x%llx reads 0x%08x, not 00:01.0; not read", ecam, cfg[0]);
+    } else {
+        UInt32 l23 = cfg[kPegL23 / 4];
+        UInt32 c20 = cfg[kPegC20 / 4];
+        UInt32 c38 = cfg[kPegC38 / 4];
+        extra.add(" ECAM 0x%llx; 0x248 0x%08x (bit7 %u, bit8 %u, bit14 %u), 0xC20 0x%08x (bits5:4 %u), 0xC38 0x%08x (bit3 %u)",
+                  ecam, l23, (l23 >> 7) & 1, (l23 >> 8) & 1, (l23 >> 14) & 1, c20, (c20 >> 4) & 3, c38, (c38 >> 3) & 1);
+        for (unsigned i = 0; i < sizeof(kPegBundles) / sizeof(kPegBundles[0]); i++)
+            extra.add(", 0x%X 0x%08x", kPegBundles[i], cfg[kPegBundles[i] / 4]);
+        UInt32 values[4] = {};
+        UInt32 counts[4] = {};
+        unsigned distinct = 0;
+        unsigned other = 0;
+        for (unsigned i = 0; i < kLtssmReads; i++) {
+            UInt32 value = cfg[kPegLtssm / 4];
+            unsigned k = 0;
+            while (k < distinct && values[k] != value)
+                k++;
+            if (k < distinct) {
+                counts[k]++;
+            } else if (distinct < 4) {
+                values[distinct] = value;
+                counts[distinct] = 1;
+                distinct++;
+            } else {
+                other++;
+            }
+            IODelay(500);
+        }
+        extra.add(", 0xC74");
+        for (unsigned k = 0; k < distinct; k++)
+            extra.add(" 0x%08x x%u", values[k], counts[k]);
+        if (other != 0)
+            extra.add(" +%u other", other);
+        extra.add(" (%u reads)", kLtssmReads);
+    }
+    if (mapping != nullptr)
+        mapping->release();
+    addResult(extra.c_str());
+}
+
+void PkgCProbe::describeCpuIo(const char *when)
+{
+    IOPCIDevice *host = nullptr;
+    IOPCIDevice *peg = nullptr;
+    IOService *bus = pmc != nullptr ? pmc->getProvider() : nullptr;
+    OSIterator *children = bus != nullptr ? bus->getChildIterator(gIOServicePlane) : nullptr;
+    if (children != nullptr) {
+        OSObject *child = nullptr;
+        while ((child = children->getNextObject()) != nullptr) {
+            IOPCIDevice *device = OSDynamicCast(IOPCIDevice, child);
+            if (device == nullptr)
+                continue;
+            int devfn = pciDevFn(device);
+            if (devfn == 0x00 && host == nullptr) {
+                host = device;
+                host->retain();
+            } else if (devfn == 0x08 && peg == nullptr) {
+                peg = device;
+                peg->retain();
+            }
+        }
+        children->release();
+    }
+    describeDmi(when, host);
+    describePeg(when, host, peg);
+    if (host != nullptr)
+        host->release();
+    if (peg != nullptr)
+        peg->release();
 }
 
 void PkgCProbe::writeIgnore(UInt32 value)
@@ -877,6 +1126,8 @@ void PkgCProbe::finishTest(const char *why)
     PcpLine line;
     line.add("%s; LTR_IGN is 0x%08x", why, pwrm != nullptr ? readPwrm(kLtrIgnore) : 0);
     addResult(line.c_str());
+    if (awake)
+        describeCpuIo("after the test");
     setProperty("State", why);
     if (applyMask != 0 && awake)
         applyFix("after the test");
@@ -913,6 +1164,11 @@ void PkgCProbe::onTimer()
     default:
         if (applyPending)
             applyFix("after wake");
+        if (dumpPending) {
+            dumpPending = false;
+            wakeDumps++;
+            describeCpuIo("after wake");
+        }
         break;
     }
 }
@@ -936,6 +1192,7 @@ IOReturn PkgCProbe::setAwakeAction(OSObject *owner, void *arg0, void *arg1, void
     if (arg0 == nullptr) {
         self->awake = false;
         self->applyPending = false;
+        self->dumpPending = false;
         self->timer->cancelTimeout();
         if (self->state == kRunning) {
             self->finishTest("stopped: the Mac went to sleep during the test");
@@ -946,10 +1203,12 @@ IOReturn PkgCProbe::setAwakeAction(OSObject *owner, void *arg0, void *arg1, void
         }
     } else {
         self->awake = true;
-        if (self->state == kDone && self->applyMask != 0 && self->writable) {
+        if (self->state == kDone && self->applyMask != 0 && self->writable)
             self->applyPending = true;
+        if (self->state == kDone && self->wakeDumps < kMaxWakeDumps)
+            self->dumpPending = true;
+        if (self->applyPending || self->dumpPending)
             self->timer->setTimeoutMS(kWakeApplyMS);
-        }
     }
     return kIOReturnSuccess;
 }
